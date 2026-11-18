@@ -31,6 +31,12 @@ function createBetterAuth() {
     trustedOrigins: [env.clientUrl],
     database: mongodbAdapter(getDb()),
 
+    // Email + password registration/login (assignment requirement).
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: 8,
+    },
+
     user: {
       modelName: "users",
       additionalFields: {

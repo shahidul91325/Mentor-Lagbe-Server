@@ -29,8 +29,10 @@
 // ---------------------------------------------------------------------------
 import express, { type ErrorRequestHandler } from "express";
 import cors from "cors";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { env } from "./src/env";
 import { connectToDatabase, getDb } from "./src/db";
+import { getAuth } from "./src/better-auth";
 
 const IS_PRODUCTION = env.nodeEnv === "production";
 
@@ -39,7 +41,7 @@ const IS_PRODUCTION = env.nodeEnv === "production";
 // ---------------------------------------------------------------------------
 const app = express();
 
-// CORS: only the frontend origin may call this API.
+// CORS: only the frontend origin may call this API (cookies included).
 app.use(
   cors({
     origin: env.clientUrl,
@@ -54,7 +56,7 @@ app.use(
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// Sections 3–13: Route handlers (added phase by phase)
+// Sections 5–13: Route handlers (added phase by phase)
 // ---------------------------------------------------------------------------
 
 /**
@@ -71,6 +73,23 @@ app.get("/api/health", async (_req, res) => {
     environment: env.nodeEnv,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// Section 4: BetterAuth integration
+// ---------------------------------------------------------------------------
+
+/** Node adapter handler for every BetterAuth route (sign-up, sign-in, session…). */
+let authNodeHandler: ReturnType<typeof toNodeHandler> | null = null;
+
+// Express 5 wildcard syntax: /api/auth/{*splat}
+// (path-to-regexp v8 no longer accepts a bare "*")
+app.all("/api/auth/{*splat}", (req, res) => {
+  if (!authNodeHandler) {
+    res.status(503).json({ message: "Authentication service is not ready yet" });
+    return;
+  }
+  return authNodeHandler(req, res);
 });
 
 // ---------------------------------------------------------------------------
@@ -101,6 +120,9 @@ app.use(errorHandler);
 // ---------------------------------------------------------------------------
 async function startServer(): Promise<void> {
   await connectToDatabase();
+
+  // BetterAuth can only be created once the database handle exists.
+  authNodeHandler = toNodeHandler(getAuth());
 
   app.listen(env.port, () => {
     console.log(`[server] MentorLagbe API listening on http://localhost:${env.port}`);
