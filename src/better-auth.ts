@@ -13,10 +13,10 @@
  * collection is introduced.
  */
 import { betterAuth } from "better-auth";
-import { mongodbAdapter } from "better-auth/adapters/mongodb";
+import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { z } from "zod";
-import { env } from "./env";
-import { getDb } from "./db";
+import { env } from "./env.js";
+import { getDb } from "./db.js";
 
 const IS_PRODUCTION = env.nodeEnv === "production";
 
@@ -29,7 +29,7 @@ function createBetterAuth() {
     secret: env.betterAuthSecret,
     // The frontend origin is allowed to call the auth endpoints.
     trustedOrigins: [env.clientUrl],
-    database: mongodbAdapter(getDb()),
+    database: mongodbAdapter(getDB()),
 
     // Email + password registration/login (assignment requirement).
     emailAndPassword: {

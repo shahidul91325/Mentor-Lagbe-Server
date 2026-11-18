@@ -13,9 +13,9 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import { ObjectId } from "mongodb";
-import { env } from "../env";
-import { getDb } from "../db";
-import type { Role, UserDoc } from "../types";
+import { env } from "../env.js";
+import { getDb } from "../db.js";
+import type { Role, User as UserDoc } from "../types.js";
 
 /** Request extended with the authenticated user (set by verifyToken). */
 export interface AuthedRequest extends Request {
@@ -44,7 +44,7 @@ export async function verifyToken(
     }
 
     // The role/plan always come from trusted server-side data.
-    const user = await getDb()
+    const user = await getDB()
       .collection<UserDoc>("users")
       .findOne({ _id: new ObjectId(decoded.sub) });
 
