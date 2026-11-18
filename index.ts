@@ -29,10 +29,12 @@
 // ---------------------------------------------------------------------------
 import express, { type ErrorRequestHandler } from "express";
 import cors from "cors";
+import jwt from "jsonwebtoken";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { env } from "./src/env";
 import { connectToDatabase, getDb } from "./src/db";
 import { getAuth } from "./src/better-auth";
+import { verifyToken, type AuthedRequest } from "./src/middleware/auth";
 
 const IS_PRODUCTION = env.nodeEnv === "production";
 
@@ -79,6 +81,24 @@ app.get("/api/health", async (_req, res) => {
 // Section 4: BetterAuth integration
 // ---------------------------------------------------------------------------
 
+/**
+ * Mints a MentorLagbe JWT for the current BetterAuth session.
+ * The frontend calls this right after sign-up/sign-in and stores the token,
+ * which is then sent as `Authorization: Bearer <token>` on protected APIs.
+ */
+app.post("/api/auth/token", async (req, res) => {
+  const session = await getAuth().api.getSession({ headers: fromNodeHeaders(req.headers) });
+
+  if (!session) {
+    res.status(401).json({ message: "No active session. Please sign in first." });
+    return;
+  }
+
+  const token = jwt.sign({ sub: session.user.id }, env.jwtSecret, { expiresIn: "7d" });
+
+  res.json({ token });
+});
+
 /** Node adapter handler for every BetterAuth route (sign-up, sign-in, session…). */
 let authNodeHandler: ReturnType<typeof toNodeHandler> | null = null;
 
@@ -90,6 +110,15 @@ app.all("/api/auth/{*splat}", (req, res) => {
     return;
   }
   return authNodeHandler(req, res);
+});
+
+// ---------------------------------------------------------------------------
+// Section 10: Profile APIs
+// ---------------------------------------------------------------------------
+
+/** Returns the signed-in user's profile (from trusted server-side data). */
+app.get("/api/users/me", verifyToken, (req: AuthedRequest, res) => {
+  res.json({ user: req.user });
 });
 
 // ---------------------------------------------------------------------------
