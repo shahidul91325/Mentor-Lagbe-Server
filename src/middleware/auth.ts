@@ -44,7 +44,7 @@ export async function verifyToken(
     }
 
     // The role/plan always come from trusted server-side data.
-    const user = await getDB()
+    const user = await getDb()
       .collection<UserDoc>("users")
       .findOne({ _id: new ObjectId(decoded.sub) });
 

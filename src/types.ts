@@ -43,7 +43,7 @@ export enum ApplicationStatus {
 
 export interface Application {
   _id: ObjectId;
-  tuitionId: string;
+  tuitionId: ObjectId;
   studentId: ObjectId;
   message?: string;
   status: ApplicationStatus;

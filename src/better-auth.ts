@@ -29,7 +29,7 @@ function createBetterAuth() {
     secret: env.betterAuthSecret,
     // The frontend origin is allowed to call the auth endpoints.
     trustedOrigins: [env.clientUrl],
-    database: mongodbAdapter(getDB()),
+    database: mongodbAdapter(getDb()),
 
     // Email + password registration/login (assignment requirement).
     emailAndPassword: {
