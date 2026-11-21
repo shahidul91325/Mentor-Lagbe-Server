@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Environment variable validation.
  *
@@ -13,7 +14,6 @@ import "dotenv/config";
 /** Core variables the server cannot start without. */
 const REQUIRED_KEYS = [
   "PORT",
-  "CLIENT_URL",
   "MONGODB_URI",
   "MONGODB_DB_NAME",
   "BETTER_AUTH_SECRET",
@@ -26,6 +26,9 @@ const FEATURE_KEYS = ["IMGBB_API_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECR
 
 function assertRequiredVariables(): void {
   const missing = REQUIRED_KEYS.filter((key) => !process.env[key]);
+  if (!process.env.CLIENT_URL && !process.env.FRONTEND_URL) {
+    missing.push("CLIENT_URL or FRONTEND_URL" as any);
+  }
 
   if (missing.length > 0) {
     throw new Error(
@@ -52,7 +55,7 @@ warnAboutMissingFeatureVariables();
 export const env = {
   port: Number(process.env.PORT),
   nodeEnv: process.env.NODE_ENV ?? "development",
-  clientUrl: process.env.CLIENT_URL as string,
+  clientUrl: (process.env.FRONTEND_URL || process.env.CLIENT_URL || "http://localhost:3000") as string,
   mongodbUri: process.env.MONGODB_URI as string,
   mongodbDbName: process.env.MONGODB_DB_NAME as string,
   betterAuthSecret: process.env.BETTER_AUTH_SECRET as string,
@@ -61,6 +64,9 @@ export const env = {
   imgbbApiKey: process.env.IMGBB_API_KEY ?? "",
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+  stripePriceId: process.env.STRIPE_PRICE_ID ?? "",
+  stripePriceIdStudent: process.env.STRIPE_PRICE_ID_STUDENT || process.env.STRIPE_PRICE_ID || "",
+  stripePriceIdTutor: process.env.STRIPE_PRICE_ID_TUTOR || process.env.STRIPE_PRICE_ID || "",
 } as const;
 
 export type Env = typeof env;

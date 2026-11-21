@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * JWT verification and role middlewares.
  *
@@ -38,15 +39,20 @@ export async function verifyToken(
 
     const decoded = jwt.verify(header.slice(7), env.jwtSecret) as jwt.JwtPayload;
 
-    if (!decoded.sub || !ObjectId.isValid(decoded.sub)) {
+    const sub = decoded.sub || (decoded as any).id;
+    if (!sub) {
       res.status(401).json({ message: "Invalid authentication token." });
       return;
     }
 
+    const query = ObjectId.isValid(sub)
+      ? { $or: [{ _id: new ObjectId(sub) }, { _id: sub as any }, { id: sub as any }] }
+      : { $or: [{ _id: sub as any }, { id: sub as any }] };
+
     // The role/plan always come from trusted server-side data.
     const user = await getDb()
       .collection<UserDoc>("users")
-      .findOne({ _id: new ObjectId(decoded.sub) });
+      .findOne(query);
 
     if (!user) {
       res.status(401).json({ message: "This account no longer exists." });
@@ -81,11 +87,11 @@ function requireRole(
 }
 
 export function verifyStudent(req: AuthedRequest, res: Response, next: NextFunction): void {
-  requireRole(req, res, next, ["student"]);
+  requireRole(req, res, next, ["student", "admin"]);
 }
 
 export function verifyTutor(req: AuthedRequest, res: Response, next: NextFunction): void {
-  requireRole(req, res, next, ["tutor"]);
+  requireRole(req, res, next, ["tutor", "admin"]);
 }
 
 export function verifyAdmin(req: AuthedRequest, res: Response, next: NextFunction): void {
