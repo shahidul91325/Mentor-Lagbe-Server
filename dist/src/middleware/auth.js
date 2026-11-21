@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import { ObjectId } from "mongodb";
 import { env } from "../env.js";
-import { getDB } from "../db.js";
+import { getDb } from "../db.js";
 /** Verifies `Authorization: Bearer <jwt>` and loads the user from MongoDB. */
 export async function verifyToken(req, res, next) {
     try {
@@ -16,7 +16,7 @@ export async function verifyToken(req, res, next) {
             return;
         }
         // The role/plan always come from trusted server-side data.
-        const user = await getDB()
+        const user = await getDb()
             .collection("users")
             .findOne({ _id: new ObjectId(decoded.sub) });
         if (!user) {
