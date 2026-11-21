@@ -1,8 +1,8 @@
 // src/types.ts
-import { ObjectId } from "mongodb";
+import { ObjectId } from 'mongodb';
 
 /** Core role definitions. */
-export type Role = "student" | "tutor" | "admin";
+export type Role = 'student' | 'tutor' | 'admin';
 
 /** User document stored in the `users` collection. */
 export interface UserDoc {
@@ -13,7 +13,7 @@ export interface UserDoc {
   role: Role;
   phone?: string;
   bio?: string;
-  plan: "free" | "pro"; // default for new accounts is "free"
+  plan: 'free' | 'pro'; // default for new accounts is "free"
   createdAt: Date;
 }
 
@@ -21,17 +21,17 @@ export type User = UserDoc;
 
 /** Legacy tuition status enum – retained for backward compatibility. */
 export const TuitionStatus = {
-  PENDING: "pending",
-  APPROVED: "approved",
-  REJECTED: "rejected",
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
 } as const;
 export type TuitionStatus = (typeof TuitionStatus)[keyof typeof TuitionStatus];
 
 /** Approval workflow status for a tuition. */
 export const TuitionApprovalStatus = {
-  PENDING: "pending",
-  APPROVED: "approved",
-  REJECTED: "rejected",
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
 } as const;
 export type TuitionApprovalStatus = (typeof TuitionApprovalStatus)[keyof typeof TuitionApprovalStatus];
 
@@ -42,7 +42,7 @@ export interface Tuition {
   title: string;
   subject: string;
   classLevel: string;
-  mode: "online" | "offline" | "hybrid";
+  mode: 'online' | 'offline' | 'hybrid';
   location?: string;
   monthlyFee: number;
   price?: number;
@@ -64,10 +64,10 @@ export type TuitionDoc = Tuition;
 
 /** Application status enumeration. */
 export const ApplicationStatus = {
-  PENDING: "pending",
-  ACCEPTED: "accepted",
-  REJECTED: "rejected",
-  APPROVED: "approved",
+  PENDING: 'pending',
+  ACCEPTED: 'accepted',
+  REJECTED: 'rejected',
+  APPROVED: 'approved',
 } as const;
 export type ApplicationStatus = (typeof ApplicationStatus)[keyof typeof ApplicationStatus];
 
@@ -104,11 +104,11 @@ export interface Payment {
   userEmail: string;
   userName: string;
   userRole: Role;
-  planName: "student-pro" | "tutor-pro";
+  planName: 'student-pro' | 'tutor-pro';
   amount: number;
   currency: string;
   transactionId: string;
   stripeSessionId: string;
-  paymentStatus: "paid" | "failed" | "pending";
+  paymentStatus: 'paid' | 'failed' | 'pending';
   paidAt: Date;
 }
