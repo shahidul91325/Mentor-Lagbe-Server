@@ -15,4 +15,5 @@ export const ApplicationStatus = {
     PENDING: "pending",
     ACCEPTED: "accepted",
     REJECTED: "rejected",
+    APPROVED: "approved",
 };

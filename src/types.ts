@@ -67,6 +67,7 @@ export const ApplicationStatus = {
   PENDING: "pending",
   ACCEPTED: "accepted",
   REJECTED: "rejected",
+  APPROVED: "approved",
 } as const;
 export type ApplicationStatus = (typeof ApplicationStatus)[keyof typeof ApplicationStatus];
 
@@ -76,7 +77,9 @@ export interface Application {
   tuitionId: ObjectId;
   tuitionTitle: string;
   subject: string;
+  classLevel?: string;
   monthlyFee: number;
+  tutorId?: ObjectId;
   tutorEmail: string;
   studentId: ObjectId;
   studentName: string;

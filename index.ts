@@ -561,25 +561,80 @@ app.get('/api/tuitions/:id', async (req, res, next) => {
       res.status(400).json({ message: 'Invalid tuition id' });
       return;
     }
+
     const tuition = await getDb()
       .collection<TuitionDoc>('tuitions')
-      .findOne({
-        _id: new ObjectId(id),
-        $or: [
-          { approvalStatus: TuitionApprovalStatus.APPROVED },
-          { status: TuitionStatus.APPROVED },
-        ],
-        $and: [
-          {
-            $or: [{ isActive: true }, { active: true }],
-          },
-        ],
-      });
+      .findOne({ _id: new ObjectId(id) });
+
     if (!tuition) {
       res.status(404).json({ message: 'Tuition not found' });
       return;
     }
-    res.json({ tuition });
+
+    const isApproved =
+      tuition.approvalStatus === TuitionApprovalStatus.APPROVED ||
+      tuition.status === TuitionStatus.APPROVED;
+    const isActive = tuition.isActive === true || tuition.active === true;
+
+    if (!isApproved || !isActive) {
+      // Check if requested by the owner tutor or an admin via optional auth token
+      let canView = false;
+      const header = req.headers.authorization;
+      if (header && header.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(header.slice(7), env.jwtSecret) as jwt.JwtPayload;
+          if (decoded.sub && ObjectId.isValid(decoded.sub)) {
+            const caller = await getDb()
+              .collection<UserDoc>('users')
+              .findOne({ _id: new ObjectId(decoded.sub) });
+            if (
+              caller &&
+              (caller.role === 'admin' ||
+                (tuition.tutorId && new ObjectId(tuition.tutorId).equals(caller._id)) ||
+                tuition.tutorEmail === caller.email)
+            ) {
+              canView = true;
+            }
+          }
+        } catch {
+          // Invalid token, canView remains false
+        }
+      }
+
+      if (!canView) {
+        res.status(404).json({ message: 'Tuition not found' });
+        return;
+      }
+    }
+
+    // Include relevant tutor details without exposing sensitive info
+    const tutorUser = tuition.tutorId
+      ? await getDb()
+          .collection<UserDoc>('users')
+          .findOne(
+            { _id: new ObjectId(tuition.tutorId) },
+            { projection: { name: 1, email: 1, image: 1, phone: 1, bio: 1, role: 1 } }
+          )
+      : await getDb()
+          .collection<UserDoc>('users')
+          .findOne(
+            { email: tuition.tutorEmail },
+            { projection: { name: 1, email: 1, image: 1, phone: 1, bio: 1, role: 1 } }
+          );
+
+    const tuitionWithTutor = {
+      ...tuition,
+      tutor: {
+        _id: tutorUser?._id ?? tuition.tutorId,
+        name: tutorUser?.name || tuition.tutorName || 'Tutor',
+        email: tutorUser?.email || tuition.tutorEmail,
+        image: tutorUser?.image,
+        phone: tutorUser?.phone,
+        bio: tutorUser?.bio,
+      },
+    };
+
+    res.json({ tuition: tuitionWithTutor });
   } catch (error) {
     next(error);
   }
@@ -798,10 +853,10 @@ app.patch(['/api/tuitions/:id/status', '/api/admin/tuitions/:id/approval'], veri
 // ---------------------------------------------------------------------------
 /** Schema for creating an application. */
 const applicationCreateSchema = z.object({
-  tuitionId: z.string(),
-  preferredSchedule: z.string().optional(),
-  studentNote: z.string().optional(),
-  message: z.string().optional(),
+  tuitionId: z.string().min(1, 'Tuition ID is required'),
+  preferredSchedule: z.string().trim().max(200).optional(),
+  studentNote: z.string().trim().max(1000).optional(),
+  message: z.string().trim().max(1000).optional(),
 });
 
 /** Student creates a new application. */
@@ -824,23 +879,33 @@ app.post('/api/applications', verifyToken, async (req: AuthedRequest, res, next)
     }
     const tuition = await getDb()
       .collection<TuitionDoc>('tuitions')
-      .findOne({
-        _id: new ObjectId(tuitionId),
-        $or: [
-          { approvalStatus: TuitionApprovalStatus.APPROVED },
-          { status: TuitionStatus.APPROVED },
-        ],
-        $and: [
-          {
-            $or: [{ isActive: true }, { active: true }],
-          },
-        ],
-      });
+      .findOne({ _id: new ObjectId(tuitionId) });
+
     if (!tuition) {
       res.status(404).json({ message: 'Tuition not found or not open for applications' });
       return;
     }
 
+    const isApproved =
+      tuition.approvalStatus === TuitionApprovalStatus.APPROVED ||
+      tuition.status === TuitionStatus.APPROVED;
+    const isActive = tuition.isActive === true || tuition.active === true;
+
+    if (!isApproved || !isActive) {
+      res.status(404).json({ message: 'Tuition not found or not open for applications' });
+      return;
+    }
+
+    // Prevent tutor from applying to their own tuition
+    const isOwnTuition =
+      (tuition.tutorId && new ObjectId(tuition.tutorId).equals(req.user._id)) ||
+      tuition.tutorEmail === req.user.email;
+    if (isOwnTuition) {
+      res.status(400).json({ message: 'Tutors cannot apply to their own tuition' });
+      return;
+    }
+
+    // Prevent duplicate application from same student for same tuition
     const existing = await getDb()
       .collection<ApplicationDoc>('applications')
       .findOne({
@@ -852,27 +917,38 @@ app.post('/api/applications', verifyToken, async (req: AuthedRequest, res, next)
       return;
     }
 
-    const appDoc: Partial<ApplicationDoc> = {
+    const finalSchedule = preferredSchedule?.trim() || undefined;
+    const finalNote = studentNote?.trim() || message?.trim() || undefined;
+
+    const appDoc: Partial<ApplicationDoc> & Record<string, unknown> = {
       tuitionId: new ObjectId(tuitionId),
       tuitionTitle: tuition.title,
       subject: tuition.subject,
+      classLevel: tuition.classLevel,
       monthlyFee: tuition.monthlyFee ?? tuition.price ?? 0,
+      tutorId: tuition.tutorId,
       tutorEmail: tuition.tutorEmail,
       studentId: req.user._id,
       studentName: req.user.name ?? '',
       studentEmail: req.user.email,
       studentPhone: req.user.phone,
-      preferredSchedule,
-      studentNote: studentNote || message,
+      preferredSchedule: finalSchedule,
+      studentNote: finalNote,
+      message: finalNote,
       status: ApplicationStatus.PENDING,
       appliedAt: new Date(),
+      createdAt: new Date(),
     };
     const result = await getDb()
       .collection<ApplicationDoc>('applications')
       .insertOne(appDoc as ApplicationDoc);
     const inserted = await getDb().collection<ApplicationDoc>('applications').findOne({ _id: result.insertedId });
     res.status(201).json({ application: inserted });
-  } catch (error) {
+  } catch (error: unknown) {
+    if ((error as { code?: number })?.code === 11000) {
+      res.status(409).json({ message: 'Application already exists for this tuition' });
+      return;
+    }
     next(error);
   }
 });
@@ -884,13 +960,43 @@ app.get(['/api/applications/my', '/api/applications/my-applications'], verifyTok
       res.status(403).json({ message: 'Only students have a My Applications view' });
       return;
     }
-    const apps = await getDb()
+    const db = getDb();
+    const apps = await db
       .collection<ApplicationDoc>('applications')
       .find({
         $or: [{ studentId: req.user._id }, { studentEmail: req.user.email }],
       })
+      .sort({ appliedAt: -1, createdAt: -1 })
       .toArray();
-    res.json({ applications: apps });
+
+    const tuitionIds = [...new Set(apps.map((a) => a.tuitionId).filter(Boolean))];
+    const tuitions = await db
+      .collection<TuitionDoc>('tuitions')
+      .find({ _id: { $in: tuitionIds } })
+      .toArray();
+    const tuitionMap = new Map(tuitions.map((t) => [t._id.toString(), t]));
+
+    const enrichedApps = apps.map((app) => {
+      const tuition = tuitionMap.get(app.tuitionId.toString());
+      return {
+        ...app,
+        createdAt: app.appliedAt || app.createdAt || new Date(),
+        tuition: {
+          _id: app.tuitionId,
+          title: app.tuitionTitle || tuition?.title || '',
+          subject: app.subject || tuition?.subject || '',
+          classLevel: tuition?.classLevel || '',
+          className: tuition?.classLevel || '',
+          location: tuition?.location || '',
+          monthlyFee: app.monthlyFee || tuition?.monthlyFee || tuition?.price || 0,
+          salary: app.monthlyFee || tuition?.monthlyFee || tuition?.price || 0,
+          tutorName: tuition?.tutorName || '',
+          tutorEmail: tuition?.tutorEmail || app.tutorEmail,
+        },
+      };
+    });
+
+    res.json({ applications: enrichedApps });
   } catch (error) {
     next(error);
   }
@@ -906,7 +1012,9 @@ app.get('/api/applications/tutor', verifyToken, async (req: AuthedRequest, res, 
     const db = getDb();
     const tutorTuitions = await db
       .collection<TuitionDoc>('tuitions')
-      .find({ tutorId: req.user._id })
+      .find({
+        $or: [{ tutorId: req.user._id }, { tutorEmail: req.user.email }],
+      })
       .toArray();
 
     const tuitionMap = new Map(tutorTuitions.map((t) => [t._id.toString(), t]));
@@ -914,23 +1022,37 @@ app.get('/api/applications/tutor', verifyToken, async (req: AuthedRequest, res, 
 
     const apps = await db
       .collection<ApplicationDoc>('applications')
-      .find({ tuitionId: { $in: tuitionIds } })
+      .find({
+        $or: [
+          { tuitionId: { $in: tuitionIds } },
+          { tutorId: req.user._id },
+          { tutorEmail: req.user.email },
+        ],
+      })
+      .sort({ appliedAt: -1, createdAt: -1 })
       .toArray();
 
     const studentEmails = [...new Set(apps.map((a) => a.studentEmail).filter(Boolean))];
+    const studentIds = [...new Set(apps.map((a) => a.studentId).filter(Boolean))];
     const students = await db
       .collection<UserDoc>('users')
-      .find({ email: { $in: studentEmails } })
+      .find({
+        $or: [{ email: { $in: studentEmails } }, { _id: { $in: studentIds } }],
+      })
       .toArray();
     const studentMap = new Map(students.map((s) => [s.email, s]));
+    const studentIdMap = new Map(students.map((s) => [s._id.toString(), s]));
 
     const enrichedApps = apps.map((app) => {
       const tuition = tuitionMap.get(app.tuitionId.toString());
-      const student = studentMap.get(app.studentEmail);
+      const student =
+        (app.studentId && studentIdMap.get(app.studentId.toString())) ||
+        studentMap.get(app.studentEmail);
 
       return {
         ...app,
         student: {
+          _id: student?._id ? student._id.toString() : (app.studentId ? app.studentId.toString() : ''),
           name: app.studentName || student?.name || 'Unknown Student',
           email: app.studentEmail,
           phone: app.studentPhone || student?.phone,
@@ -940,10 +1062,12 @@ app.get('/api/applications/tutor', verifyToken, async (req: AuthedRequest, res, 
           _id: app.tuitionId,
           title: app.tuitionTitle || tuition?.title || 'Tuition',
           subject: app.subject || tuition?.subject || 'Subject',
+          classLevel: tuition?.classLevel || '',
           location: tuition?.location || 'Location not specified',
           monthlyFee: app.monthlyFee || tuition?.monthlyFee || tuition?.price,
+          salary: app.monthlyFee || tuition?.monthlyFee || tuition?.price,
         },
-        createdAt: app.appliedAt || (app as unknown as { createdAt?: Date }).createdAt || new Date(),
+        createdAt: app.appliedAt || app.createdAt || new Date(),
       };
     });
 
@@ -966,7 +1090,11 @@ app.patch('/api/applications/:id/status', verifyToken, async (req: AuthedRequest
       return;
     }
     const statusSchema = z.object({
-      status: z.enum([ApplicationStatus.ACCEPTED, ApplicationStatus.REJECTED]),
+      status: z.enum([
+        ApplicationStatus.ACCEPTED,
+        ApplicationStatus.REJECTED,
+        'approved',
+      ]),
     });
     const parseResult = statusSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -981,17 +1109,31 @@ app.patch('/api/applications/:id/status', verifyToken, async (req: AuthedRequest
       res.status(404).json({ message: 'Application not found' });
       return;
     }
-    const tuition = await getDb().collection<TuitionDoc>('tuitions').findOne({ _id: application.tuitionId });
-    if (!tuition || (!tuition.tutorId.equals(req.user._id) && tuition.tutorEmail !== req.user.email)) {
+    const tuition = await getDb()
+      .collection<TuitionDoc>('tuitions')
+      .findOne({ _id: application.tuitionId });
+
+    const isOwner =
+      (tuition?.tutorId && new ObjectId(tuition.tutorId).equals(req.user._id)) ||
+      tuition?.tutorEmail === req.user.email ||
+      (application.tutorId && new ObjectId(application.tutorId).equals(req.user._id)) ||
+      application.tutorEmail === req.user.email;
+
+    if (!isOwner) {
       res.status(403).json({ message: 'You do not own this application' });
       return;
     }
+
+    const targetStatus =
+      parseResult.data.status === 'approved'
+        ? ApplicationStatus.ACCEPTED
+        : parseResult.data.status;
 
     await getDb()
       .collection<ApplicationDoc>('applications')
       .updateOne(
         { _id: new ObjectId(appId) },
-        { $set: { status: parseResult.data.status }, $currentDate: { updatedAt: true } }
+        { $set: { status: targetStatus }, $currentDate: { updatedAt: true } }
       );
     const refreshed = await getDb()
       .collection<ApplicationDoc>('applications')
@@ -1022,7 +1164,7 @@ app.delete('/api/applications/:id', verifyToken, async (req: AuthedRequest, res,
       return;
     }
     const isOwner =
-      (application.studentId && application.studentId.equals(req.user._id)) ||
+      (application.studentId && new ObjectId(application.studentId).equals(req.user._id)) ||
       application.studentEmail === req.user.email;
     if (!isOwner) {
       res.status(403).json({ message: 'You do not own this application' });
@@ -1064,7 +1206,10 @@ app.get('/api/dashboard/student', verifyToken, async (req: AuthedRequest, res, n
     const [total, pending, accepted, rejected] = await Promise.all([
       applicationsColl.countDocuments(studentFilter),
       applicationsColl.countDocuments({ ...studentFilter, status: ApplicationStatus.PENDING }),
-      applicationsColl.countDocuments({ ...studentFilter, status: ApplicationStatus.ACCEPTED }),
+      applicationsColl.countDocuments({
+        ...studentFilter,
+        status: { $in: [ApplicationStatus.ACCEPTED, 'approved'] },
+      }),
       applicationsColl.countDocuments({ ...studentFilter, status: ApplicationStatus.REJECTED }),
     ]);
 
@@ -1131,7 +1276,10 @@ app.get('/api/dashboard/tutor', verifyToken, async (req: AuthedRequest, res, nex
     const [totalApplicants, pendingApplicants, acceptedApplicants] = await Promise.all([
       applicationColl.countDocuments({ tuitionId: { $in: tuitionIds } }),
       applicationColl.countDocuments({ tuitionId: { $in: tuitionIds }, status: ApplicationStatus.PENDING }),
-      applicationColl.countDocuments({ tuitionId: { $in: tuitionIds }, status: ApplicationStatus.ACCEPTED }),
+      applicationColl.countDocuments({
+        tuitionId: { $in: tuitionIds },
+        status: { $in: [ApplicationStatus.ACCEPTED, 'approved'] },
+      }),
     ]);
 
     const recentTuitions = await tuitionColl.find({ tutorId }).sort({ createdAt: -1 }).limit(5).toArray();
