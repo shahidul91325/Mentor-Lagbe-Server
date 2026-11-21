@@ -2125,8 +2125,8 @@ app.post('/api/payments/create-checkout-session', verifyToken, async (req: Authe
       customer: stripeCustomerId,
       mode: 'subscription',
       line_items: lineItems,
-      success_url: `${env.clientUrl}/pricing?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${env.clientUrl}/pricing?payment=cancelled`,
+      success_url: `${env.clientUrl}/payment/success?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${env.clientUrl}/payment/success?payment=cancelled`,
       metadata: {
         userId: req.user._id.toString(),
         userEmail: req.user.email,
@@ -2228,7 +2228,9 @@ app.post('/api/payments/webhook', async (req, res) => {
         const userRole = (session.metadata?.userRole || 'student') as Role;
         const planName = (session.metadata?.planName || (userRole === 'tutor' ? 'tutor-pro' : 'student-pro')) as Payment['planName'];
         const amountTotal = session.amount_total ? session.amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
-        const isPaid = session.payment_status === 'paid';
+        // For subscription mode, payment_status can be 'paid', 'no_payment_required', or 'unpaid'
+        // Treat 'no_payment_required' as paid (e.g., free trials, $0 subscriptions)
+        const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
 
         const userObjectId = userIdStr && ObjectId.isValid(userIdStr) ? new ObjectId(userIdStr) : null;
 
@@ -2247,29 +2249,55 @@ app.post('/api/payments/webhook', async (req, res) => {
           setFields.paidAt = new Date();
         }
 
-        await db.collection<Payment>('payments').updateOne(
-          { stripeCheckoutSessionId: session.id },
-          {
-            $set: setFields,
-            $setOnInsert: {
+        // Build the update operation - only insert if we have a valid user identifier
+        const updateOperation: Record<string, unknown> = { $set: setFields };
+        if (userObjectId) {
+          updateOperation.$setOnInsert = {
+            _id: new ObjectId(),
+            userId: userObjectId,
+            userEmail: session.metadata?.userEmail || '',
+            userName: session.metadata?.userName || 'Subscriber',
+            userRole,
+            planName,
+            paymentType: 'subscription',
+            transactionId: session.id,
+            createdAt: new Date(),
+          };
+        } else if (session.metadata?.userEmail) {
+          // Fallback: try to find user by email for $setOnInsert
+          const userByEmail = await db.collection<UserDoc>('users').findOne({ email: session.metadata.userEmail });
+          if (userByEmail) {
+            updateOperation.$setOnInsert = {
               _id: new ObjectId(),
-              userId: userObjectId || new ObjectId(),
-              userEmail: session.metadata?.userEmail || '',
-              userName: session.metadata?.userName || 'Subscriber',
-              userRole,
+              userId: userByEmail._id,
+              userEmail: session.metadata.userEmail,
+              userName: session.metadata?.userName || userByEmail.name || 'Subscriber',
+              userRole: userByEmail.role,
               planName,
               paymentType: 'subscription',
               transactionId: session.id,
               createdAt: new Date(),
-            },
-          },
+            };
+          }
+        }
+
+        await db.collection<Payment>('payments').updateOne(
+          { stripeCheckoutSessionId: session.id },
+          updateOperation,
           { upsert: true }
         );
 
         // Only a verified, paid checkout may activate Premium membership.
-        if (isPaid && userObjectId) {
+        // Determine the target user ID for plan upgrade
+        let targetUserId: ObjectId | null = userObjectId;
+        if (!targetUserId && session.metadata?.userEmail) {
+          const userByEmail = await db.collection<UserDoc>('users').findOne({ email: session.metadata.userEmail });
+          if (userByEmail) targetUserId = userByEmail._id;
+        }
+
+        if (isPaid && targetUserId) {
           await db.collection<UserDoc>('users').updateOne(
-            { _id: userObjectId },
+            { _id: targetUserId },
             { $set: { plan: 'pro', stripeCustomerId: customerId || '', updatedAt: new Date() } }
           );
 
@@ -2277,7 +2305,7 @@ app.post('/api/payments/webhook', async (req, res) => {
             try {
               const sub = await stripe.subscriptions.retrieve(subId);
               await upsertSubscriptionRecord(db, sub, {
-                userId: userObjectId,
+                userId: targetUserId,
                 userEmail: session.metadata?.userEmail || '',
                 userRole,
               });
@@ -2286,7 +2314,7 @@ app.post('/api/payments/webhook', async (req, res) => {
                 { stripeSubscriptionId: subId },
                 {
                   $set: {
-                    userId: userObjectId,
+                    userId: targetUserId,
                     userEmail: session.metadata?.userEmail || '',
                     userRole,
                     plan: 'pro',
@@ -2696,6 +2724,159 @@ app.get('/api/admin/payments/:id', verifyToken, async (req: AuthedRequest, res, 
 });
 
 /**
+ * Admin manually approves a pending payment after verifying with Stripe.
+ * Only for payments that are stuck in pending state due to webhook issues.
+ * Verifies directly with Stripe before approving.
+ */
+app.patch('/api/admin/payments/:id/approve', verifyToken, async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      res.status(403).json({ message: 'Admin access required' });
+      return;
+    }
+
+    if (!stripe) {
+      res.status(503).json({ message: 'Stripe payments are not configured.' });
+      return;
+    }
+
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      res.status(400).json({ message: 'Invalid payment id' });
+      return;
+    }
+
+    const db = getDb();
+    const payment = await db.collection<Payment>('payments').findOne({ _id: new ObjectId(id) });
+
+    if (!payment) {
+      res.status(404).json({ message: 'Payment not found' });
+      return;
+    }
+
+    // Only allow approval for pending payments
+    const currentStatus = payment.paymentStatus ?? payment.status;
+    if (currentStatus === 'paid') {
+      res.status(400).json({ message: 'Payment is already approved/paid' });
+      return;
+    }
+
+    if (currentStatus === 'failed' || currentStatus === 'canceled' || currentStatus === 'refunded') {
+      res.status(400).json({ message: `Cannot approve a ${currentStatus} payment` });
+      return;
+    }
+
+    // Verify with Stripe using the checkout session ID
+    const sessionId = payment.stripeCheckoutSessionId || payment.stripeSessionId;
+    if (!sessionId) {
+      res.status(400).json({ message: 'No Stripe session ID found for this payment' });
+      return;
+    }
+
+    let session: Stripe.Checkout.Session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (stripeErr) {
+      console.error('[admin approve] Stripe session retrieval failed:', stripeErr);
+      res.status(400).json({ message: 'Failed to verify payment with Stripe' });
+      return;
+    }
+
+    // Check payment status from Stripe
+    const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+    if (!isPaid) {
+      res.status(400).json({
+        message: `Stripe reports payment status: ${session.payment_status}. Cannot approve unpaid payment.`,
+      });
+      return;
+    }
+
+    // Verify the session belongs to the payment's user
+    if (session.metadata?.userId && payment.userId) {
+      const sessionUserId = session.metadata.userId;
+      const paymentUserId = payment.userId.toString();
+      if (sessionUserId !== paymentUserId) {
+        res.status(400).json({ message: 'Stripe session user does not match payment record' });
+        return;
+      }
+    }
+
+    // Update payment record
+    const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id || '';
+    const subId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id || '';
+    const paymentIntentId =
+      typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '';
+    const amountTotal = session.amount_total ? session.amount_total / 100 : payment.amount;
+
+    await db.collection<Payment>('payments').updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: 'paid',
+          paymentStatus: 'paid',
+          amount: amountTotal,
+          currency: session.currency || payment.currency || 'usd',
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: subId,
+          stripePaymentIntentId: paymentIntentId,
+          paymentMethod: (session as any).payment_method_types?.[0] || payment.paymentMethod || null,
+          paidAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    // Upgrade user to Pro plan
+    if (payment.userId) {
+      await db.collection<UserDoc>('users').updateOne(
+        { _id: payment.userId },
+        { $set: { plan: 'pro', stripeCustomerId: customerId || payment.stripeCustomerId || '', updatedAt: new Date() } }
+      );
+    }
+
+    // Sync subscription if available
+    if (subId && payment.userId) {
+      try {
+        const sub = await stripe.subscriptions.retrieve(subId);
+        await upsertSubscriptionRecord(db, sub, {
+          userId: payment.userId,
+          userEmail: payment.userEmail || session.metadata?.userEmail || '',
+          userRole: payment.userRole || (session.metadata?.userRole as Role) || 'student',
+        });
+      } catch (subErr) {
+        console.warn('[admin approve] Could not sync Stripe subscription:', subErr);
+        await db.collection<Subscription>('subscriptions').updateOne(
+          { stripeSubscriptionId: subId },
+          {
+            $set: {
+              userId: payment.userId,
+              userEmail: payment.userEmail || session.metadata?.userEmail || '',
+              userRole: payment.userRole || (session.metadata?.userRole as Role) || 'student',
+              plan: 'pro',
+              stripeCustomerId: customerId || '',
+              stripeSubscriptionId: subId,
+              status: 'active',
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              _id: new ObjectId(),
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+      }
+    }
+
+    const updatedPayment = await db.collection<Payment>('payments').findOne({ _id: new ObjectId(id) });
+    res.json({ payment: updatedPayment, message: 'Payment approved and user upgraded to Pro' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * Securely verifies a checkout session with Stripe and syncs state if paid.
  */
 app.get('/api/payments/verify-session/:sessionId', verifyToken, async (req: AuthedRequest, res, next) => {
@@ -2717,7 +2898,8 @@ app.get('/api/payments/verify-session/:sessionId', verifyToken, async (req: Auth
       return;
     }
 
-    const isPaid = session.payment_status === 'paid';
+    // For subscription mode, payment_status can be 'paid', 'no_payment_required', or 'unpaid'
+    const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
     const db = getDb();
 
     if (isPaid) {
