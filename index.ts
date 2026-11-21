@@ -68,6 +68,11 @@ app.use(
 // Must be registered before express.json().
 app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
 
+// Image uploads travel as base64 JSON, so this route needs a larger body limit
+// than the default 100kb. Registered before the global JSON parser; body-parser
+// marks the request as parsed so the global parser skips it afterwards.
+app.use('/api/upload/image', express.json({ limit: '8mb' }));
+
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -2669,9 +2674,33 @@ app.get('/api/admin/payments', verifyToken, async (req: AuthedRequest, res, next
     const db = getDb();
     const paymentsColl = db.collection<Payment>('payments');
 
-    const [payments, total] = await Promise.all([
+    const [payments, total, paidSummary, pendingCount, failedCount] = await Promise.all([
       paymentsColl.find(filter).sort(sort).skip(skip).limit(limitNum).toArray(),
       paymentsColl.countDocuments(filter),
+      paymentsColl
+        .aggregate<{ totalAmount: number; count: number }>([
+          {
+            $match: {
+              $and: [filter, { $or: [{ status: 'paid' }, { paymentStatus: 'paid' }] }],
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalAmount: { $sum: '$amount' },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+      paymentsColl.countDocuments({
+        ...filter,
+        $or: [{ status: 'pending' }, { paymentStatus: 'pending' }],
+      }),
+      paymentsColl.countDocuments({
+        ...filter,
+        $or: [{ status: 'failed' }, { paymentStatus: 'failed' }],
+      }),
     ]);
 
     const totalPages = Math.ceil(total / limitNum) || 1;
@@ -2682,6 +2711,12 @@ app.get('/api/admin/payments', verifyToken, async (req: AuthedRequest, res, next
       page: pageNum,
       limit: limitNum,
       totalPages,
+      summary: {
+        totalPaidAmount: paidSummary[0]?.totalAmount ?? 0,
+        paidCount: paidSummary[0]?.count ?? 0,
+        pendingCount,
+        failedCount,
+      },
     });
   } catch (error) {
     next(error);
@@ -2893,22 +2928,53 @@ app.get('/api/payments/verify-session/:sessionId', verifyToken, async (req: Auth
 
     const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
 
-    if (session.metadata?.userId && session.metadata.userId !== req.user._id.toString()) {
+    const sessionCustomerId =
+      typeof session.customer === 'string' ? session.customer : session.customer?.id || '';
+
+    // A checkout session may only ever be verified by the user who created it.
+    // Sessions minted by this server always carry metadata.userId; the customer
+    // id is a second check for sessions created before that metadata existed.
+    if (session.metadata?.userId) {
+      if (session.metadata.userId !== req.user._id.toString()) {
+        res.status(403).json({ message: 'Unauthorized session verification.' });
+        return;
+      }
+    } else if (!sessionCustomerId || sessionCustomerId !== req.user.stripeCustomerId) {
+      res.status(403).json({ message: 'Unauthorized session verification.' });
+      return;
+    }
+
+    const db = getDb();
+
+    const linkedPayment = await db
+      .collection<Payment>('payments')
+      .findOne({ stripeCheckoutSessionId: session.id });
+
+    if (linkedPayment?.userId && linkedPayment.userId.toString() !== req.user._id.toString()) {
       res.status(403).json({ message: 'Unauthorized session verification.' });
       return;
     }
 
     // For subscription mode, payment_status can be 'paid', 'no_payment_required', or 'unpaid'
     const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
-    const db = getDb();
 
     if (isPaid) {
+      const amount = session.amount_total ? session.amount_total / 100 : linkedPayment?.amount;
+      const paymentIntentId =
+        typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '';
+
       await db.collection<Payment>('payments').updateOne(
         { stripeCheckoutSessionId: session.id },
         {
           $set: {
             status: 'paid',
             paymentStatus: 'paid',
+            ...(typeof amount === 'number' ? { amount } : {}),
+            currency: session.currency || linkedPayment?.currency || 'usd',
+            stripeCustomerId: sessionCustomerId || linkedPayment?.stripeCustomerId || '',
+            stripePaymentIntentId: paymentIntentId || linkedPayment?.stripePaymentIntentId || '',
+            paymentMethod:
+              (session as any).payment_method_types?.[0] || linkedPayment?.paymentMethod || null,
             paidAt: new Date(),
             updatedAt: new Date(),
           },
@@ -2965,7 +3031,154 @@ app.get('/api/payments/verify-session/:sessionId', verifyToken, async (req: Auth
 });
 
 // ---------------------------------------------------------------------------
-// 12. 404 & Error handling
+// 12. Public platform statistics & secure image upload
+// ---------------------------------------------------------------------------
+
+/**
+ * Public, read-only platform counters used by the homepage.
+ * Only aggregate counts are exposed — no personal data.
+ */
+app.get('/api/stats', async (_req, res, next) => {
+  try {
+    const db = getDb();
+
+    const approvedAndActive = {
+      $or: [{ approvalStatus: TuitionApprovalStatus.APPROVED }, { status: TuitionStatus.APPROVED }],
+      $and: [{ $or: [{ isActive: true }, { active: true }] }],
+    } as Record<string, unknown>;
+
+    const [tuitions, tutors, students, applications, acceptedApplications] = await Promise.all([
+      db.collection<TuitionDoc>('tuitions').countDocuments(approvedAndActive),
+      db.collection<UserDoc>('users').countDocuments({ role: 'tutor' }),
+      db.collection<UserDoc>('users').countDocuments({ role: 'student' }),
+      db.collection<ApplicationDoc>('applications').countDocuments({}),
+      db
+        .collection<ApplicationDoc>('applications')
+        .countDocuments({ status: { $in: [ApplicationStatus.ACCEPTED, 'approved'] } }),
+    ]);
+
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({
+      stats: {
+        tuitions,
+        tutors,
+        students,
+        applications,
+        acceptedApplications,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+interface ImgBBResponse {
+  data?: {
+    url?: string;
+    display_url?: string;
+    delete_url?: string;
+    width?: number;
+    height?: number;
+  };
+  error?: { message?: string };
+}
+
+/**
+ * Secure ImgBB image upload.
+ *
+ * The ImgBB API key stays on the server; the client only sends a base64
+ * image (validated for type and size). The returned permanent URL is what
+ * callers must persist (for example as a tuition `bannerImage`).
+ */
+app.post('/api/upload/image', verifyToken, async (req: AuthedRequest, res, next) => {
+  try {
+    if (!req.user) {
+      res.status(401).json({ message: 'Authentication required. Please sign in.' });
+      return;
+    }
+
+    if (!env.imgbbApiKey) {
+      res.status(503).json({ message: 'Image uploads are not configured on the server.' });
+      return;
+    }
+
+    const schema = z.object({
+      image: z.string().min(1, 'Image data is required'),
+      name: z.string().max(120).optional(),
+    });
+
+    const parseResult = schema.safeParse(req.body);
+
+    if (!parseResult.success) {
+      res.status(400).json({
+        message: 'Invalid image payload',
+        issues: parseResult.error.issues,
+      });
+      return;
+    }
+
+    const raw = parseResult.data.image.trim();
+    const dataUrlMatch = raw.match(/^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/);
+
+    let base64 = raw;
+
+    if (raw.startsWith('data:')) {
+      if (!dataUrlMatch) {
+        res.status(400).json({ message: 'Unsupported image format. Use PNG, JPG, WEBP or GIF.' });
+        return;
+      }
+      base64 = dataUrlMatch[2];
+    } else if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) {
+      res.status(400).json({ message: 'Invalid image data.' });
+      return;
+    }
+
+    const byteLength = Buffer.byteLength(base64, 'base64');
+
+    if (byteLength === 0) {
+      res.status(400).json({ message: 'The selected image is empty.' });
+      return;
+    }
+
+    if (byteLength > 5 * 1024 * 1024) {
+      res.status(413).json({ message: 'Image size must be less than 5MB.' });
+      return;
+    }
+
+    const form = new URLSearchParams();
+    form.set('key', env.imgbbApiKey);
+    form.set('image', base64);
+    if (parseResult.data.name) {
+      form.set('name', parseResult.data.name);
+    }
+
+    const imgbbResponse = await fetch('https://api.imgbb.com/1/upload', {
+      method: 'POST',
+      body: form,
+    });
+
+    const payload = (await imgbbResponse.json().catch(() => null)) as ImgBBResponse | null;
+
+    if (!imgbbResponse.ok || !payload?.data?.url) {
+      console.error('[imgbb] Upload failed:', payload?.error?.message || imgbbResponse.status);
+      res.status(502).json({ message: 'Image upload failed. Please try again.' });
+      return;
+    }
+
+    res.json({
+      url: payload.data.url,
+      displayUrl: payload.data.display_url || payload.data.url,
+      deleteUrl: payload.data.delete_url,
+      width: payload.data.width,
+      height: payload.data.height,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. 404 & Error handling
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
