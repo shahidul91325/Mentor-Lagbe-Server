@@ -47,7 +47,7 @@ import {
   type Subscription,
   type ProcessedEvent,
 } from './src/types.js';
-import { ObjectId } from 'mongodb';
+import { Db, ObjectId } from 'mongodb';
 
 const IS_PRODUCTION = env.nodeEnv === 'production';
 const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : null;
@@ -1860,12 +1860,18 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
     const tuitionsColl = db.collection<TuitionDoc>('tuitions');
     const applicationsColl = db.collection<ApplicationDoc>('applications');
     const paymentsColl = db.collection<Payment>('payments');
+    const subscriptionsColl = db.collection<Subscription>('subscriptions');
 
     const [totalUsers, studentCount, tutorCount, adminCount] = await Promise.all([
       usersColl.countDocuments({}),
       usersColl.countDocuments({ role: 'student' }),
       usersColl.countDocuments({ role: 'tutor' }),
       usersColl.countDocuments({ role: 'admin' }),
+    ]);
+
+    const [freeMemberCount, premiumMemberCount] = await Promise.all([
+      usersColl.countDocuments({ plan: 'free' }),
+      usersColl.countDocuments({ plan: 'pro' }),
     ]);
 
     const [totalTuitions, pendingTuitions, approvedTuitions, rejectedTuitions] = await Promise.all([
@@ -1883,18 +1889,28 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
 
     const totalApplications = await applicationsColl.countDocuments({});
 
+    const [activeSubscriptions, canceledSubscriptions] = await Promise.all([
+      subscriptionsColl.countDocuments({ status: { $in: ['active', 'trialing'] } }),
+      subscriptionsColl.countDocuments({ status: 'canceled' }),
+    ]);
+
     const paymentAgg = await paymentsColl
-      .aggregate<{ totalRevenue: number; count: number }>([
-        { $match: { paymentStatus: 'paid' } },
-        {
-          $group: {
-            _id: null,
-            totalRevenue: { $sum: '$amount' },
-            count: { $sum: 1 },
+      .aggregate<{ totalRevenue: number; count: number }>(
+        [
+          { $match: { paymentStatus: 'paid' } },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: '$amount' },
+              count: { $sum: 1 },
+            },
           },
-        },
-      ])
+        ]
+      )
       .toArray();
+
+    const pendingPaymentCount = await paymentsColl.countDocuments({ $or: [{ paymentStatus: 'pending' }, { status: 'pending' }] });
+    const failedPaymentCount = await paymentsColl.countDocuments({ $or: [{ paymentStatus: 'failed' }, { status: 'failed' }] });
 
     const paymentStats = paymentAgg[0] || {
       totalRevenue: 0,
@@ -1905,7 +1921,11 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
 
     const recentTuitions = await tuitionsColl.find({}).sort({ createdAt: -1 }).limit(5).toArray();
 
-    const recentPayments = await paymentsColl.find({ paymentStatus: 'paid' }).sort({ paidAt: -1 }).limit(5).toArray();
+    const recentPayments = await paymentsColl
+      .find({ paymentStatus: 'paid' })
+      .sort({ paidAt: -1 })
+      .limit(5)
+      .toArray();
 
     res.json({
       users: {
@@ -1913,6 +1933,8 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
         studentCount,
         tutorCount,
         adminCount,
+        freeMembers: freeMemberCount,
+        premiumMembers: premiumMemberCount,
         recent: recentUsers,
       },
       tuitions: {
@@ -1925,9 +1947,15 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
       applications: {
         total: totalApplications,
       },
+      subscriptions: {
+        active: activeSubscriptions,
+        canceled: canceledSubscriptions,
+      },
       payments: {
         totalPaid: paymentStats.count,
         totalRevenue: paymentStats.totalRevenue,
+        pending: pendingPaymentCount,
+        failed: failedPaymentCount,
         recent: recentPayments,
       },
       stats: {
@@ -1935,13 +1963,19 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
         studentCount,
         tutorCount,
         adminCount,
+        freeMembers: freeMemberCount,
+        premiumMembers: premiumMemberCount,
         totalTuitions,
         pendingTuitions,
         approvedTuitions,
         rejectedTuitions,
         totalApplications,
+        activeSubscriptions,
+        canceledSubscriptions,
         totalRevenue: paymentStats.totalRevenue,
         paidCount: paymentStats.count,
+        pendingPayments: pendingPaymentCount,
+        failedPayments: failedPaymentCount,
       },
       recentUsers,
       recentTuitions,
@@ -1955,6 +1989,48 @@ app.get('/api/dashboard/admin', verifyToken, async (req: AuthedRequest, res, nex
 // ---------------------------------------------------------------------------
 // 11. Payment & Stripe APIs
 // ---------------------------------------------------------------------------
+
+/**
+ * Upserts a subscription record from a Stripe Subscription object and links it
+ * to a MongoDB user. Idempotent on stripeSubscriptionId.
+ */
+async function upsertSubscriptionRecord(
+  db: Db,
+  sub: Stripe.Subscription,
+  { userId, userEmail, userRole }: { userId: ObjectId; userEmail: string; userRole: Role },
+): Promise<void> {
+  const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || '';
+  const priceId = sub.items?.data?.[0]?.price?.id || '';
+  const status = sub.status as Subscription['status'];
+  const currentPeriodStart = new Date((sub as any).current_period_start * 1000);
+  const currentPeriodEnd = new Date((sub as any).current_period_end * 1000);
+  const isProActive = status === 'active' || status === 'trialing';
+
+  await db.collection<Subscription>('subscriptions').updateOne(
+    { stripeSubscriptionId: sub.id },
+    {
+      $set: {
+        userId,
+        userEmail,
+        userRole,
+        plan: isProActive ? 'pro' : 'free',
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: sub.id,
+        stripePriceId: priceId,
+        status,
+        currentPeriodStart,
+        currentPeriodEnd,
+        cancelAtPeriodEnd: sub.cancel_at_period_end,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: {
+        _id: new ObjectId(),
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
 
 /**
  * Creates a Stripe Checkout Session for subscription upgrade.
@@ -2124,28 +2200,20 @@ app.post('/api/payments/webhook', async (req, res) => {
   try {
     event = stripe.webhooks.constructEvent(rawBody, sig as string, env.stripeWebhookSecret);
   } catch (err: any) {
-    console.error(`[stripe webhook] Signature verification failed: ${err?.message}`);
+    console.error('[stripe webhook] Signature verification failed:', err?.message);
     res.status(400).send(`Webhook Error: ${err?.message}`);
     return;
   }
 
   const db = getDb();
+  const eventsColl = db.collection<ProcessedEvent>('processed_events');
 
-  // Enforce idempotency using processed_events collection
-  try {
-    await db.collection<ProcessedEvent>('processed_events').insertOne({
-      _id: new ObjectId(),
-      eventId: event.id,
-      type: event.type,
-      processedAt: new Date(),
-    });
-  } catch (err: any) {
-    if (err?.code === 11000) {
-      console.log(`[stripe webhook] Event ${event.id} already processed. Acknowledging.`);
-      res.json({ received: true, duplicate: true });
-      return;
-    }
-    console.error('[stripe webhook] Idempotency record error:', err);
+  // Idempotency: skip events we already fully processed.
+  const already = await eventsColl.findOne({ eventId: event.id });
+  if (already) {
+    console.log(`[stripe webhook] Event ${event.id} already processed. Acknowledging.`);
+    res.json({ received: true, duplicate: true });
+    return;
   }
 
   try {
@@ -2153,55 +2221,119 @@ app.post('/api/payments/webhook', async (req, res) => {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session;
         const userIdStr = session.metadata?.userId;
-        const subId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id;
-        const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
-        const userRole = session.metadata?.userRole as Role | undefined;
+        const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id || '';
+        const subId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id || '';
+        const paymentIntentId =
+          typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '';
+        const userRole = (session.metadata?.userRole || 'student') as Role;
+        const planName = (session.metadata?.planName || (userRole === 'tutor' ? 'tutor-pro' : 'student-pro')) as Payment['planName'];
         const amountTotal = session.amount_total ? session.amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
+        const isPaid = session.payment_status === 'paid';
+
+        const userObjectId = userIdStr && ObjectId.isValid(userIdStr) ? new ObjectId(userIdStr) : null;
+
+        const setFields: Record<string, unknown> = {
+          status: isPaid ? 'paid' : 'pending',
+          paymentStatus: isPaid ? 'paid' : 'pending',
+          amount: amountTotal,
+          currency: session.currency || 'usd',
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: subId,
+          stripePaymentIntentId: paymentIntentId,
+          paymentMethod: (session as any).payment_method_types?.[0] || null,
+          updatedAt: new Date(),
+        };
+        if (isPaid) {
+          setFields.paidAt = new Date();
+        }
 
         await db.collection<Payment>('payments').updateOne(
           { stripeCheckoutSessionId: session.id },
           {
-            $set: {
-              status: 'paid',
-              paymentStatus: 'paid',
-              amount: amountTotal,
-              currency: session.currency || 'usd',
-              stripeCustomerId: customerId,
-              stripeSubscriptionId: subId,
-              paidAt: new Date(),
-              updatedAt: new Date(),
+            $set: setFields,
+            $setOnInsert: {
+              _id: new ObjectId(),
+              userId: userObjectId || new ObjectId(),
+              userEmail: session.metadata?.userEmail || '',
+              userName: session.metadata?.userName || 'Subscriber',
+              userRole,
+              planName,
+              paymentType: 'subscription',
+              transactionId: session.id,
+              createdAt: new Date(),
             },
-          }
+          },
+          { upsert: true }
         );
 
-        if (userIdStr && ObjectId.isValid(userIdStr)) {
-          const userObjectId = new ObjectId(userIdStr);
+        // Only a verified, paid checkout may activate Premium membership.
+        if (isPaid && userObjectId) {
           await db.collection<UserDoc>('users').updateOne(
             { _id: userObjectId },
-            { $set: { plan: 'pro', stripeCustomerId: customerId, updatedAt: new Date() } }
+            { $set: { plan: 'pro', stripeCustomerId: customerId || '', updatedAt: new Date() } }
           );
+
+          if (subId) {
+            try {
+              const sub = await stripe.subscriptions.retrieve(subId);
+              await upsertSubscriptionRecord(db, sub, {
+                userId: userObjectId,
+                userEmail: session.metadata?.userEmail || '',
+                userRole,
+              });
+            } catch {
+              await db.collection<Subscription>('subscriptions').updateOne(
+                { stripeSubscriptionId: subId },
+                {
+                  $set: {
+                    userId: userObjectId,
+                    userEmail: session.metadata?.userEmail || '',
+                    userRole,
+                    plan: 'pro',
+                    stripeCustomerId: customerId || '',
+                    stripeSubscriptionId: subId,
+                    status: 'active',
+                    updatedAt: new Date(),
+                  },
+                  $setOnInsert: {
+                    _id: new ObjectId(),
+                    createdAt: new Date(),
+                  },
+                },
+                { upsert: true }
+              );
+            }
+          }
         }
         break;
       }
 
       case 'invoice.paid': {
         const invoice = event.data.object as Stripe.Invoice;
-        const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
-        const subId = typeof (invoice as any).subscription === 'string' ? (invoice as any).subscription : (invoice as any).subscription?.id;
+        const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id || '';
+        const subId = typeof (invoice as any).subscription === 'string' ? (invoice as any).subscription : (invoice as any).subscription?.id || '';
         const paymentIntentId =
-          typeof (invoice as any).payment_intent === 'string' ? (invoice as any).payment_intent : (invoice as any).payment_intent?.id;
+          typeof (invoice as any).payment_intent === 'string' ? (invoice as any).payment_intent : (invoice as any).payment_intent?.id || '';
         const amount = invoice.amount_paid ? invoice.amount_paid / 100 : 0;
         const currency = invoice.currency || 'usd';
 
-        // Find associated user
         let user: UserDoc | null = null;
         if (customerId) {
           user = await db.collection<UserDoc>('users').findOne({ stripeCustomerId: customerId });
         }
 
-        if (paymentIntentId) {
+        // Update the existing payment linked to this invoice. Never insert a
+        // brand-new payment here, to avoid duplicating the checkout-session record.
+        const paymentFilter: Record<string, unknown> = {};
+        if (paymentIntentId) paymentFilter.stripePaymentIntentId = paymentIntentId;
+        if (subId) paymentFilter.stripeSubscriptionId = subId;
+        if (!paymentIntentId && !subId && customerId) {
+          paymentFilter.stripeCustomerId = customerId;
+        }
+
+        if (Object.keys(paymentFilter).length > 0) {
           await db.collection<Payment>('payments').updateOne(
-            { stripePaymentIntentId: paymentIntentId },
+            paymentFilter,
             {
               $set: {
                 status: 'paid',
@@ -2210,31 +2342,50 @@ app.post('/api/payments/webhook', async (req, res) => {
                 currency,
                 stripeCustomerId: customerId,
                 stripeSubscriptionId: subId,
+                stripePaymentIntentId: paymentIntentId,
                 paidAt: new Date(),
                 updatedAt: new Date(),
               },
-              $setOnInsert: {
-                _id: new ObjectId(),
-                userId: user?._id || new ObjectId(),
-                userEmail: user?.email || invoice.customer_email || '',
-                userName: user?.name || invoice.customer_name || 'Subscriber',
-                userRole: user?.role || 'student',
-                planName: user?.role === 'tutor' ? 'tutor-pro' : 'student-pro',
-                paymentType: 'subscription',
-                stripePaymentIntentId: paymentIntentId,
-                transactionId: paymentIntentId,
-                createdAt: new Date(),
-              },
-            },
-            { upsert: true }
+            }
           );
         }
 
         if (user) {
           await db.collection<UserDoc>('users').updateOne(
             { _id: user._id },
-            { $set: { plan: 'pro', updatedAt: new Date() } }
+            { $set: { plan: 'pro', stripeCustomerId: customerId || user.stripeCustomerId || '', updatedAt: new Date() } }
           );
+        }
+
+        if (subId && user) {
+          try {
+            const sub = await stripe.subscriptions.retrieve(subId);
+            await upsertSubscriptionRecord(db, sub, {
+              userId: user._id,
+              userEmail: user.email,
+              userRole: user.role,
+            });
+          } catch {
+            await db.collection<Subscription>('subscriptions').updateOne(
+              { stripeSubscriptionId: subId },
+              {
+                $set: {
+                  userId: user._id,
+                  userEmail: user.email,
+                  userRole: user.role,
+                  plan: 'pro',
+                  stripeCustomerId: customerId || '',
+                  status: 'active',
+                  updatedAt: new Date(),
+                },
+                $setOnInsert: {
+                  _id: new ObjectId(),
+                  createdAt: new Date(),
+                },
+              },
+              { upsert: true }
+            );
+          }
         }
         break;
       }
@@ -2242,7 +2393,7 @@ app.post('/api/payments/webhook', async (req, res) => {
       case 'customer.subscription.created':
       case 'customer.subscription.updated': {
         const sub = event.data.object as Stripe.Subscription;
-        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || '';
         const userIdStr = sub.metadata?.userId;
 
         let user: UserDoc | null = null;
@@ -2254,44 +2405,21 @@ app.post('/api/payments/webhook', async (req, res) => {
         }
 
         if (user) {
-          const priceId = sub.items?.data?.[0]?.price?.id || '';
-          const status = sub.status;
-          const currentPeriodStart = new Date((sub as any).current_period_start * 1000);
-          const currentPeriodEnd = new Date((sub as any).current_period_end * 1000);
-          const cancelAtPeriodEnd = sub.cancel_at_period_end;
-          const isProActive = status === 'active' || status === 'trialing';
+          await upsertSubscriptionRecord(db, sub, {
+            userId: user._id,
+            userEmail: user.email,
+            userRole: user.role,
+          });
 
-          await db.collection<Subscription>('subscriptions').updateOne(
-            { stripeSubscriptionId: sub.id },
-            {
-              $set: {
-                userId: user._id,
-                userEmail: user.email,
-                userRole: user.role,
-                plan: isProActive ? 'pro' : 'free',
-                stripeCustomerId: customerId || '',
-                stripeSubscriptionId: sub.id,
-                stripePriceId: priceId,
-                status: status as any,
-                currentPeriodStart,
-                currentPeriodEnd,
-                cancelAtPeriodEnd,
-                updatedAt: new Date(),
-              },
-              $setOnInsert: {
-                _id: new ObjectId(),
-                createdAt: new Date(),
-              },
-            },
-            { upsert: true }
-          );
+          const status = sub.status;
+          const isProActive = status === 'active' || status === 'trialing';
 
           await db.collection<UserDoc>('users').updateOne(
             { _id: user._id },
             {
               $set: {
                 plan: isProActive ? 'pro' : 'free',
-                stripeCustomerId: customerId || user.stripeCustomerId,
+                stripeCustomerId: customerId || user.stripeCustomerId || '',
                 updatedAt: new Date(),
               },
             }
@@ -2302,21 +2430,19 @@ app.post('/api/payments/webhook', async (req, res) => {
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object as Stripe.Subscription;
+        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || '';
+
         await db.collection<Subscription>('subscriptions').updateOne(
           { stripeSubscriptionId: sub.id },
           {
-            $set: {
-              status: 'canceled',
-              plan: 'free',
-              updatedAt: new Date(),
-            },
+            $set: { status: 'canceled', plan: 'free', updatedAt: new Date() },
           }
         );
 
-        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
-        if (customerId) {
+        const user = customerId ? await db.collection<UserDoc>('users').findOne({ stripeCustomerId: customerId }) : null;
+        if (user) {
           await db.collection<UserDoc>('users').updateOne(
-            { stripeCustomerId: customerId },
+            { _id: user._id },
             { $set: { plan: 'free', updatedAt: new Date() } }
           );
         }
@@ -2325,19 +2451,27 @@ app.post('/api/payments/webhook', async (req, res) => {
 
       case 'invoice.payment_failed': {
         const invoice = event.data.object as Stripe.Invoice;
+        const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id || '';
+        const subId = typeof (invoice as any).subscription === 'string' ? (invoice as any).subscription : (invoice as any).subscription?.id || '';
         const paymentIntentId =
-          typeof (invoice as any).payment_intent === 'string' ? (invoice as any).payment_intent : (invoice as any).payment_intent?.id;
+          typeof (invoice as any).payment_intent === 'string' ? (invoice as any).payment_intent : (invoice as any).payment_intent?.id || '';
 
-        if (paymentIntentId) {
+        const filter: Record<string, unknown> = {};
+        if (paymentIntentId) filter.stripePaymentIntentId = paymentIntentId;
+        if (subId) filter.stripeSubscriptionId = subId;
+        if (!paymentIntentId && !subId && customerId) filter.stripeCustomerId = customerId;
+
+        if (Object.keys(filter).length > 0) {
           await db.collection<Payment>('payments').updateOne(
-            { stripePaymentIntentId: paymentIntentId },
-            {
-              $set: {
-                status: 'failed',
-                paymentStatus: 'failed',
-                updatedAt: new Date(),
-              },
-            }
+            filter,
+            { $set: { status: 'failed', paymentStatus: 'failed', updatedAt: new Date() } }
+          );
+        }
+
+        if (subId) {
+          await db.collection<Subscription>('subscriptions').updateOne(
+            { stripeSubscriptionId: subId },
+            { $set: { status: 'past_due', updatedAt: new Date() } }
           );
         }
         break;
@@ -2345,6 +2479,20 @@ app.post('/api/payments/webhook', async (req, res) => {
 
       default:
         console.log(`[stripe webhook] Unhandled event type: ${event.type}`);
+    }
+
+    // Record the event only after successful handling.
+    try {
+      await eventsColl.insertOne({
+        _id: new ObjectId(),
+        eventId: event.id,
+        type: event.type,
+        processedAt: new Date(),
+      });
+    } catch (err: any) {
+      if (err?.code !== 11000) {
+        console.error('[stripe webhook] Idempotency record error:', err);
+      }
     }
 
     res.json({ received: true });
@@ -2413,6 +2561,135 @@ app.get('/api/payments/history', verifyToken, async (req: AuthedRequest, res, ne
       .toArray();
 
     res.json({ payments });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 11b. Admin Payment Management
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a paginated, filterable list of payments for admins.
+ * Only administrators may list all users' payments.
+ */
+app.get('/api/admin/payments', verifyToken, async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      res.status(403).json({ message: 'Admin access required' });
+      return;
+    }
+
+    const {
+      page = '1',
+      limit = '20',
+      search,
+      status,
+      plan,
+      startDate,
+      endDate,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+    } = req.query as Record<string, string | undefined>;
+
+    const filter: Record<string, unknown> = {};
+    const andConditions: Record<string, unknown>[] = [];
+
+    if (status) {
+      andConditions.push({ $or: [{ paymentStatus: status }, { status }] });
+    }
+
+    if (plan) {
+      filter.planName = plan;
+    }
+
+    if (startDate || endDate) {
+      const dateFilter: Record<string, unknown> = {};
+      if (startDate) dateFilter.$gte = new Date(startDate);
+      if (endDate) dateFilter.$lte = new Date(endDate);
+      andConditions.push({ $or: [{ createdAt: dateFilter }, { paidAt: dateFilter }] });
+    }
+
+    if (search) {
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
+      andConditions.push({
+        $or: [
+          { userName: { $regex: regex } },
+          { userEmail: { $regex: regex } },
+          { transactionId: { $regex: regex } },
+          { stripeCheckoutSessionId: { $regex: regex } },
+          { stripeSubscriptionId: { $regex: regex } },
+        ],
+      });
+    }
+
+    if (andConditions.length > 0) {
+      filter.$and = andConditions;
+    }
+
+    const pageNum = Math.max(parseInt(page || '1', 10) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit || '20', 10) || 20, 1), 100);
+    const skip = (pageNum - 1) * limitNum;
+
+    const validSortFields = ['createdAt', 'paidAt', 'amount', 'userName', 'userEmail', 'status', 'paymentStatus'];
+    const sortField = validSortFields.includes(sortBy || '') ? sortBy! : 'createdAt';
+    const sort: Record<string, 1 | -1> = {};
+    sort[sortField] = sortOrder === 'asc' ? 1 : -1;
+
+    const db = getDb();
+    const paymentsColl = db.collection<Payment>('payments');
+
+    const [payments, total] = await Promise.all([
+      paymentsColl.find(filter).sort(sort).skip(skip).limit(limitNum).toArray(),
+      paymentsColl.countDocuments(filter),
+    ]);
+
+    const totalPages = Math.ceil(total / limitNum) || 1;
+
+    res.json({
+      payments,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      totalPages,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Returns a single payment's details for admins.
+ */
+app.get('/api/admin/payments/:id', verifyToken, async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      res.status(403).json({ message: 'Admin access required' });
+      return;
+    }
+
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      res.status(400).json({ message: 'Invalid payment id' });
+      return;
+    }
+
+    const db = getDb();
+    const payment = await db.collection<Payment>('payments').findOne({ _id: new ObjectId(id) });
+
+    if (!payment) {
+      res.status(404).json({ message: 'Payment not found' });
+      return;
+    }
+
+    const sub = await db.collection<Subscription>('subscriptions').findOne({
+      $or: [{ stripeSubscriptionId: payment.stripeSubscriptionId }, { userId: payment.userId }],
+    });
+
+    res.json({ payment, subscription: sub ?? null });
   } catch (error) {
     next(error);
   }
