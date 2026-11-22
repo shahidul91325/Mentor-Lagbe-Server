@@ -81,7 +81,8 @@ function createBetterAuth() {
       user: {
         create: {
           before: async (user) => {
-            const role = (user as { role?: unknown }).role;
+            const role = (user as { role?: unknown; data?: { role?: unknown } }).role ??
+              (user as { data?: { role?: unknown } }).data?.role;
 
             if (role === "admin") {
               throw new Error("Admin accounts cannot be created through public registration.");
@@ -92,7 +93,8 @@ function createBetterAuth() {
         },
         update: {
           before: async (user) => {
-            const role = (user as { role?: unknown }).role;
+            const role = (user as { role?: unknown; data?: { role?: unknown } }).role ??
+              (user as { data?: { role?: unknown } }).data?.role;
 
             if (role === "admin") {
               throw new Error("The admin role can only be assigned by an administrator.");

@@ -125,7 +125,7 @@ const handleAuthToken = async (req: express.Request, res: express.Response, next
   try {
     let userId: string | null = null;
 
-    // 1. Try BetterAuth session first
+    // 1. Try BetterAuth session first using standard header conversion
     try {
       const session = await getAuth().api.getSession({
         headers: fromNodeHeaders(req.headers),
@@ -135,10 +135,29 @@ const handleAuthToken = async (req: express.Request, res: express.Response, next
         userId = session.user.id;
       }
     } catch {
-      // BetterAuth session lookup may fail on malformed headers; fall back to Bearer token
+      // BetterAuth session lookup may fail on malformed headers; fall back to manual cookie parsing
     }
 
-    // 2. If no BetterAuth session, check Authorization: Bearer <token>
+    // 2. Fallback: manually parse BetterAuth session cookie and verify
+    if (!userId) {
+      const cookieHeader = req.headers.cookie || '';
+      const sessionCookieMatch = cookieHeader.match(/better-auth\.session_token=([^;]+)/);
+      if (sessionCookieMatch) {
+        try {
+          const sessionCookieValue = decodeURIComponent(sessionCookieMatch[1]);
+          const headers = new Headers();
+          headers.set('cookie', `better-auth.session_token=${sessionCookieValue}`);
+          const session = await getAuth().api.getSession({ headers });
+          if (session?.user?.id) {
+            userId = session.user.id;
+          }
+        } catch {
+          // Manual cookie verification failed; continue to Bearer token fallback
+        }
+      }
+    }
+
+    // 3. If no BetterAuth session, check Authorization: Bearer <token>
     if (!userId && req.headers.authorization?.startsWith('Bearer ')) {
       const rawToken = req.headers.authorization.slice(7);
       try {
