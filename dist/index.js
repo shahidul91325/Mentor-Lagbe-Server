@@ -62,6 +62,19 @@ app.use(express.urlencoded({ extended: true }));
 // ---------------------------------------------------------------------------
 // 3. Health check
 // ---------------------------------------------------------------------------
+// Ensure database connectivity before any route handler runs (Vercel serverless safe).
+app.use(async (_req, res, next) => {
+    try {
+        await connectToDatabase();
+        if (!authNodeHandler) {
+            authNodeHandler = toNodeHandler(getAuth());
+        }
+        next();
+    }
+    catch (error) {
+        next(error);
+    }
+});
 app.get('/api/health', async (_req, res, next) => {
     try {
         await getDb().command({ ping: 1 });
@@ -2873,8 +2886,10 @@ process.on('uncaughtException', (error) => {
     console.error('[server] Uncaught Exception:', error);
     process.exit(1);
 });
-startServer().catch((error) => {
-    console.error('[server] Failed to start:', error);
-    process.exit(1);
-});
+if (!process.env.VERCEL) {
+    startServer().catch((error) => {
+        console.error('[server] Failed to start:', error);
+        process.exit(1);
+    });
+}
 export default app;
