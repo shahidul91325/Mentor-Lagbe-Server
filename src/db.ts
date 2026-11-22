@@ -4,18 +4,33 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
-const client = new MongoClient(uri);
-let db: Db;
-// Database name can be provided via MONGODB_DB_NAME env variable, defaulting to 'mentor-lagbe'
 const dbName = process.env.MONGODB_DB_NAME || 'mentor-lagbe';
 
-export async function connectToDatabase() {
-  if (!db) {
-    await client.connect();
-    db = client.db(dbName);
-    console.log(`Connected to MongoDB database: ${dbName}`);
+const client = new MongoClient(uri, {
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 10000,
+});
+
+let db: Db | null = null;
+let connectionPromise: Promise<Db> | null = null;
+
+export async function connectToDatabase(): Promise<Db> {
+  if (db) return db;
+  if (!connectionPromise) {
+    connectionPromise = (async () => {
+      await client.connect();
+      const database = client.db(dbName);
+      await database.command({ ping: 1 });
+      db = database;
+      console.log(`Connected to MongoDB database: ${dbName}`);
+      return database;
+    })().catch((err) => {
+      connectionPromise = null;
+      db = null;
+      throw err;
+    });
   }
-  return db;
+  return connectionPromise;
 }
 
 export function getDb(): Db {
@@ -23,3 +38,6 @@ export function getDb(): Db {
   return db;
 }
 
+export async function ensureDatabase(): Promise<Db> {
+  return connectToDatabase();
+}
