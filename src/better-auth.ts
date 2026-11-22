@@ -45,7 +45,7 @@ function createBetterAuth() {
           type: "string",
           required: true,
           input: true,
-          validator: { input: z.enum(["student", "tutor", "admin"]) },
+          validator: { input: z.enum(["student", "tutor"]) },
         },
         plan: {
           type: "string",
