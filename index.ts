@@ -124,6 +124,18 @@ app.get('/api/health', async (_req, res, next) => {
 const handleAuthToken = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   try {
     let userId: string | null = null;
+    const cookieHeader = req.headers.cookie || '';
+    const hasCookie = !!cookieHeader;
+
+    // Log incoming request details for diagnostics (no sensitive data)
+    console.info('[auth/token] Request received', {
+      method: req.method,
+      hasCookie,
+      cookieLength: cookieHeader.length,
+      cookieNames: cookieHeader.split(';').map(c => c.trim().split('=')[0]),
+      hasAuthHeader: !!req.headers.authorization,
+      userAgent: req.headers['user-agent']?.substring(0, 50),
+    });
 
     // 1. Try BetterAuth session using standard header conversion
     // This preserves all cookies including session cookies for cross-origin requests
@@ -134,28 +146,29 @@ const handleAuthToken = async (req: express.Request, res: express.Response, next
 
       if (session?.user?.id) {
         userId = session.user.id;
+        console.info('[auth/token] Session validated via fromNodeHeaders', { userId });
+      } else {
+        console.debug('[auth/token] fromNodeHeaders returned no session');
       }
     } catch (err) {
-      // BetterAuth session lookup may fail on malformed headers; continue to fallback
       console.debug('[auth/token] getSession via fromNodeHeaders failed:', err instanceof Error ? err.message : 'unknown error');
     }
 
     // 2. Fallback: pass the complete original Cookie header to BetterAuth
     // This handles cases where fromNodeHeaders doesn't properly forward cookies in serverless environments
-    if (!userId) {
-      const cookieHeader = req.headers.cookie;
-      if (cookieHeader) {
-        try {
-          const headers = new Headers();
-          headers.set('cookie', cookieHeader);
-          const session = await getAuth().api.getSession({ headers });
-          if (session?.user?.id) {
-            userId = session.user.id;
-            console.debug('[auth/token] Session validated via full Cookie header fallback');
-          }
-        } catch (err) {
-          console.debug('[auth/token] getSession via full Cookie header failed:', err instanceof Error ? err.message : 'unknown error');
+    if (!userId && hasCookie) {
+      try {
+        const headers = new Headers();
+        headers.set('cookie', cookieHeader);
+        const session = await getAuth().api.getSession({ headers });
+        if (session?.user?.id) {
+          userId = session.user.id;
+          console.info('[auth/token] Session validated via full Cookie header fallback', { userId });
+        } else {
+          console.debug('[auth/token] Full Cookie header fallback returned no session');
         }
+      } catch (err) {
+        console.debug('[auth/token] getSession via full Cookie header failed:', err instanceof Error ? err.message : 'unknown error');
       }
     }
 
@@ -168,15 +181,21 @@ const handleAuthToken = async (req: express.Request, res: express.Response, next
         const sub = decoded.sub || (decoded as any).id;
         if (sub) {
           userId = String(sub);
-          console.debug('[auth/token] User authenticated via Bearer JWT fallback');
+          console.info('[auth/token] User authenticated via Bearer JWT fallback', { userId });
         }
-      } catch {
-        // Invalid or expired JWT
+      } catch (err) {
+        console.debug('[auth/token] Bearer JWT verification failed:', err instanceof Error ? err.message : 'unknown error');
       }
     }
 
     if (!userId) {
-      console.warn('[auth/token] No valid session found - cookie missing, invalid, or expired');
+      console.warn('[auth/token] No valid session found', {
+        hasCookie,
+        cookieNames: cookieHeader.split(';').map(c => c.trim().split('=')[0]),
+        triedFromNodeHeaders: true,
+        triedFullCookieHeader: hasCookie,
+        triedBearerToken: !!req.headers.authorization?.startsWith('Bearer '),
+      });
       res.status(401).json({
         message: 'No active session. Please sign in first.',
       });
@@ -197,6 +216,8 @@ const handleAuthToken = async (req: express.Request, res: express.Response, next
       });
       return;
     }
+
+    console.info('[auth/token] JWT minted successfully', { userId: user._id.toString(), role: user.role });
 
     const payload = {
       sub: user._id.toString(),
@@ -235,6 +256,14 @@ app.use('/api/auth', (req, res) => {
     });
     return;
   }
+
+  // Diagnostic logging for BetterAuth routes
+  console.info('[better-auth] Request received', {
+    method: req.method,
+    path: req.path,
+    hasCookie: !!req.headers.cookie,
+    cookieNames: (req.headers.cookie || '').split(';').map(c => c.trim().split('=')[0]),
+  });
 
   return authNodeHandler(req, res);
 });
