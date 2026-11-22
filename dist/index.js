@@ -586,9 +586,34 @@ app.get('/api/tuitions', async (req, res, next) => {
         const sort = {};
         sort[sortField] = sortOrder === 'asc' ? 1 : -1;
         const tuitions = await collection.find(filter).sort(sort).skip(skip).limit(limit).toArray();
+        // Enrich each tuition with basic tutor info (name, email, image) so public
+        // cards can show the tutor without a separate request per tuition.
+        const tutorIds = [...new Set(tuitions.map((t) => t.tutorId).filter(Boolean))];
+        let tutorMap = new Map();
+        if (tutorIds.length > 0) {
+            const tutors = await getDb()
+                .collection('users')
+                .find({ _id: { $in: tutorIds } })
+                .project({ name: 1, email: 1, image: 1 })
+                .toArray();
+            tutorMap = new Map(tutors.map((t) => [t._id.toString(), { name: t.name, email: t.email, image: t.image }]));
+        }
+        const enrichedTuitions = tuitions.map((t) => {
+            const tutorId = t.tutorId ? t.tutorId.toString() : '';
+            const tutor = tutorMap.get(tutorId);
+            return {
+                ...t,
+                tutor: {
+                    _id: tutorId,
+                    name: tutor?.name || t.tutorName || 'Tutor',
+                    email: tutor?.email || t.tutorEmail,
+                    image: tutor?.image,
+                },
+            };
+        });
         const totalPages = Math.ceil(total / limit) || 1;
         res.json({
-            tuitions,
+            tuitions: enrichedTuitions,
             total,
             page,
             limit,
@@ -614,6 +639,65 @@ app.get('/api/tuitions/my', verifyToken, async (req, res, next) => {
     }
 });
 /** Get a single tuition with all saved fields and tutor details. */
+/** Student lists their saved (bookmarked) tuitions. */
+app.get('/api/tuitions/bookmarks/saved', verifyToken, async (req, res, next) => {
+    try {
+        if (!req.user || req.user.role !== 'student') {
+            res.status(403).json({ message: 'Only students can view saved tuitions' });
+            return;
+        }
+        const userId = req.user._id;
+        const user = await getDb()
+            .collection('users')
+            .findOne({ _id: userId });
+        const savedIds = user?.savedTuitionIds ?? [];
+        // Clean up references to tuitions that no longer exist, so a student's
+        // saved list never contains dangling ids.
+        const validIds = savedIds.filter((id) => ObjectId.isValid(id));
+        let tuitions = [];
+        if (validIds.length > 0) {
+            tuitions = await getDb()
+                .collection('tuitions')
+                .find({ _id: { $in: validIds.map((id) => new ObjectId(id)) } })
+                .sort({ createdAt: -1 })
+                .toArray();
+        }
+        const existingIds = new Set(tuitions.map((t) => t._id.toString()));
+        const cleanedIds = savedIds.filter((id) => existingIds.has(id));
+        if (cleanedIds.length !== savedIds.length) {
+            await getDb()
+                .collection('users')
+                .updateOne({ _id: userId }, { $set: { savedTuitionIds: cleanedIds }, $currentDate: { updatedAt: true } });
+        }
+        // Enrich with tutor information (mirrors the single-tuition detail endpoint).
+        const tutorIds = [...new Set(tuitions.map((t) => t.tutorId).filter(Boolean))];
+        const tutors = await getDb()
+            .collection('users')
+            .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id.toString())) } })
+            .toArray();
+        const tutorMap = new Map(tutors.map((t) => [t._id.toString(), { _id: t._id.toString(), name: t.name, email: t.email, image: t.image }]));
+        const savedTuitions = tuitions.map((t) => ({
+            ...t,
+            tutor: {
+                _id: t.tutorId?.toString() ?? '',
+                name: tutorMap.get(t.tutorId?.toString() ?? '')?.name || t.tutorName || 'Tutor',
+                email: tutorMap.get(t.tutorId?.toString() ?? '')?.email || t.tutorEmail,
+                image: tutorMap.get(t.tutorId?.toString() ?? '')?.image,
+            },
+        }));
+        res.json({
+            savedTuitions,
+            total: savedTuitions.length,
+            savedTuitionIds: cleanedIds,
+            limit: BOOKMARK_FREE_LIMIT,
+            plan: req.user.plan,
+            unlimited: req.user.plan === 'pro',
+        });
+    }
+    catch (error) {
+        next(error);
+    }
+});
 app.get('/api/tuitions/:id', async (req, res, next) => {
     try {
         const id = req.params.id;
@@ -791,12 +875,11 @@ app.patch('/api/tuitions/:id', verifyToken, async (req, res, next) => {
             });
             return;
         }
-        if (tuition.approvalStatus === TuitionApprovalStatus.APPROVED || tuition.status === TuitionStatus.APPROVED) {
-            res.status(403).json({
-                message: 'Approved tuitions can only be edited by admin',
-            });
-            return;
-        }
+        // Remember whether the tuition is currently approved so we can require
+        // re-moderation after any listing change (edited listings must not bypass
+        // admin moderation).
+        const wasApproved = tuition.approvalStatus === TuitionApprovalStatus.APPROVED ||
+            tuition.status === TuitionStatus.APPROVED;
         // All supported editable tuition fields.
         const partialSchema = z.object({
             title: z.string().min(1).optional(),
@@ -840,6 +923,12 @@ app.patch('/api/tuitions/:id', verifyToken, async (req, res, next) => {
         if (update.active !== undefined) {
             update.isActive = update.active;
         }
+        // An edited approved tuition must return to pending for admin review;
+        // it must not bypass moderation.
+        if (wasApproved) {
+            update.approvalStatus = TuitionApprovalStatus.PENDING;
+            update.status = TuitionStatus.PENDING;
+        }
         await getDb()
             .collection('tuitions')
             .updateOne({ _id: new ObjectId(id) }, {
@@ -882,10 +971,174 @@ app.delete('/api/tuitions/:id', verifyToken, async (req, res, next) => {
             });
             return;
         }
+        const tuitionObjectId = new ObjectId(id);
+        // Delete the tuition.
+        await getDb().collection('tuitions').deleteOne({ _id: tuitionObjectId });
+        // Handle related applications safely: remove applications for this tuition
+        // so no orphaned references remain.
+        await getDb()
+            .collection('applications')
+            .deleteMany({ tuitionId: tuitionObjectId });
+        // Remove this tuition from every student's saved bookmarks so deleted
+        // listings never resurface in a saved-tuitions list.
+        await getDb()
+            .collection('users')
+            .updateMany({}, { $pull: { savedTuitionIds: id } });
+        res.json({ message: 'Tuition deleted' });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+const BOOKMARK_FREE_LIMIT = 5;
+/** Bookmark schemas. */
+const bookmarkIdSchema = z.object({
+    id: z.string().refine((val) => ObjectId.isValid(val), { message: 'Invalid tuition id' }),
+});
+/** Student adds a tuition to their saved bookmarks (Free: max 5, Pro: unlimited). */
+app.post('/api/tuitions/:id/bookmark', verifyToken, async (req, res, next) => {
+    try {
+        // Only students may use student bookmarking (not tutors or admins).
+        if (!req.user || req.user.role !== 'student') {
+            res.status(403).json({
+                message: 'Only students can bookmark tuitions',
+            });
+            return;
+        }
+        const parseResult = bookmarkIdSchema.safeParse({ id: req.params.id });
+        if (!parseResult.success) {
+            res.status(400).json({ message: 'Invalid tuition id' });
+            return;
+        }
+        const tuitionId = parseResult.data.id;
+        const tuition = await getDb()
+            .collection('tuitions')
+            .findOne({ _id: new ObjectId(tuitionId) });
+        if (!tuition) {
+            res.status(404).json({ message: 'Tuition not found' });
+            return;
+        }
+        const userId = req.user._id;
+        const currentUser = await getDb()
+            .collection('users')
+            .findOne({ _id: userId });
+        const savedIds = currentUser?.savedTuitionIds ?? [];
+        // Prevent duplicate bookmarks.
+        if (savedIds.includes(tuitionId)) {
+            const refreshed = await getDb()
+                .collection('users')
+                .findOne({ _id: userId });
+            return res.json({
+                message: 'Tuition is already saved',
+                saved: false,
+                alreadySaved: true,
+                savedTuitionIds: refreshed?.savedTuitionIds ?? [],
+            });
+        }
+        // Enforce Free plan limit on the backend.
+        if (req.user.plan !== 'pro' && savedIds.length >= BOOKMARK_FREE_LIMIT) {
+            return res.status(403).json({
+                message: 'You have reached the free plan limit of 5 saved tuitions. Upgrade to Pro for unlimited bookmarks.',
+                limitReached: true,
+                limit: BOOKMARK_FREE_LIMIT,
+                saved: false,
+                savedTuitionIds: savedIds,
+            });
+        }
+        await getDb()
+            .collection('users')
+            .updateOne({ _id: userId }, { $push: { savedTuitionIds: tuitionId }, $currentDate: { updatedAt: true } });
+        const refreshed = await getDb()
+            .collection('users')
+            .findOne({ _id: userId });
+        res.status(201).json({
+            message: 'Tuition saved successfully',
+            saved: true,
+            savedTuitionIds: refreshed?.savedTuitionIds ?? [],
+        });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+/** Student removes a tuition from their saved bookmarks. */
+app.delete('/api/tuitions/:id/bookmark', verifyToken, async (req, res, next) => {
+    try {
+        if (!req.user || req.user.role !== 'student') {
+            res.status(403).json({
+                message: 'Only students can remove bookmarks',
+            });
+            return;
+        }
+        const parseResult = bookmarkIdSchema.safeParse({ id: req.params.id });
+        if (!parseResult.success) {
+            res.status(400).json({ message: 'Invalid tuition id' });
+            return;
+        }
+        const tuitionId = parseResult.data.id;
+        const userId = req.user._id;
+        await getDb()
+            .collection('users')
+            .updateOne({ _id: userId }, { $pull: { savedTuitionIds: tuitionId }, $currentDate: { updatedAt: true } });
+        const refreshed = await getDb()
+            .collection('users')
+            .findOne({ _id: userId });
+        res.json({
+            message: 'Bookmark removed',
+            saved: false,
+            savedTuitionIds: refreshed?.savedTuitionIds ?? [],
+        });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+/** Tutor activates or closes their own tuition (isActive toggle). */
+app.patch('/api/tuitions/:id/active', verifyToken, async (req, res, next) => {
+    try {
+        if (!req.user || req.user.role !== 'tutor') {
+            res.status(403).json({ message: 'Only tutors can activate or close tuitions' });
+            return;
+        }
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+            res.status(400).json({ message: 'Invalid tuition id' });
+            return;
+        }
+        const schema = z.object({
+            isActive: z.boolean(),
+        });
+        const parseResult = schema.safeParse(req.body);
+        if (!parseResult.success) {
+            res.status(400).json({ message: 'Invalid request', issues: parseResult.error.issues });
+            return;
+        }
+        const { isActive } = parseResult.data;
+        const tuition = await getDb()
+            .collection('tuitions')
+            .findOne({ _id: new ObjectId(id) });
+        if (!tuition) {
+            res.status(404).json({ message: 'Tuition not found' });
+            return;
+        }
+        if (!tuition.tutorId.equals(req.user._id)) {
+            res.status(403).json({ message: 'You do not own this tuition' });
+            return;
+        }
+        // Approval status is preserved independently of active/closed status.
         await getDb()
             .collection('tuitions')
-            .deleteOne({ _id: new ObjectId(id) });
-        res.json({ message: 'Tuition deleted' });
+            .updateOne({ _id: new ObjectId(id) }, {
+            $set: { isActive, active: isActive },
+            $currentDate: { updatedAt: true },
+        });
+        const refreshed = await getDb()
+            .collection('tuitions')
+            .findOne({ _id: new ObjectId(id) });
+        res.json({
+            message: isActive ? 'Tuition activated' : 'Tuition closed',
+            tuition: refreshed,
+        });
     }
     catch (error) {
         next(error);

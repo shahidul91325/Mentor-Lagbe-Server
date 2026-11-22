@@ -799,6 +799,77 @@ app.get('/api/tuitions/my', verifyToken, async (req: AuthedRequest, res, next) =
 });
 
 /** Get a single tuition with all saved fields and tutor details. */
+/** Student lists their saved (bookmarked) tuitions. */
+app.get('/api/tuitions/bookmarks/saved', verifyToken, async (req: AuthedRequest, res, next) => {
+  try {
+    if (!req.user || req.user.role !== 'student') {
+      res.status(403).json({ message: 'Only students can view saved tuitions' });
+      return;
+    }
+
+    const userId = req.user._id;
+
+    const user = await getDb()
+      .collection<UserDoc>('users')
+      .findOne({ _id: userId });
+
+    const savedIds: string[] = user?.savedTuitionIds ?? [];
+
+    // Clean up references to tuitions that no longer exist, so a student's
+    // saved list never contains dangling ids.
+    const validIds = savedIds.filter((id) => ObjectId.isValid(id));
+
+    let tuitions: TuitionDoc[] = [];
+    if (validIds.length > 0) {
+      tuitions = await getDb()
+        .collection<TuitionDoc>('tuitions')
+        .find({ _id: { $in: validIds.map((id) => new ObjectId(id)) } })
+        .sort({ createdAt: -1 })
+        .toArray();
+    }
+
+    const existingIds = new Set(tuitions.map((t) => t._id.toString()));
+    const cleanedIds = savedIds.filter((id) => existingIds.has(id));
+
+    if (cleanedIds.length !== savedIds.length) {
+      await getDb()
+        .collection<UserDoc>('users')
+        .updateOne({ _id: userId }, { $set: { savedTuitionIds: cleanedIds }, $currentDate: { updatedAt: true } });
+    }
+
+    // Enrich with tutor information (mirrors the single-tuition detail endpoint).
+    const tutorIds = [...new Set(tuitions.map((t) => t.tutorId).filter(Boolean))];
+    const tutors = await getDb()
+      .collection<UserDoc>('users')
+      .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id.toString())) } })
+      .toArray();
+    const tutorMap = new Map(
+      tutors.map((t) => [t._id.toString(), { _id: t._id.toString(), name: t.name, email: t.email, image: t.image }])
+    );
+
+    const savedTuitions = tuitions.map((t) => ({
+      ...t,
+      tutor: {
+        _id: t.tutorId?.toString() ?? '',
+        name: tutorMap.get(t.tutorId?.toString() ?? '')?.name || t.tutorName || 'Tutor',
+        email: tutorMap.get(t.tutorId?.toString() ?? '')?.email || t.tutorEmail,
+        image: tutorMap.get(t.tutorId?.toString() ?? '')?.image,
+      },
+    }));
+
+    res.json({
+      savedTuitions,
+      total: savedTuitions.length,
+      savedTuitionIds: cleanedIds,
+      limit: BOOKMARK_FREE_LIMIT,
+      plan: req.user.plan,
+      unlimited: req.user.plan === 'pro',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/tuitions/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
@@ -1311,76 +1382,6 @@ app.delete(
   }
 );
 
-/** Student lists their saved (bookmarked) tuitions. */
-app.get('/api/tuitions/bookmarks/saved', verifyToken, async (req: AuthedRequest, res, next) => {
-  try {
-    if (!req.user || req.user.role !== 'student') {
-      res.status(403).json({ message: 'Only students can view saved tuitions' });
-      return;
-    }
-
-    const userId = req.user._id;
-
-    const user = await getDb()
-      .collection<UserDoc>('users')
-      .findOne({ _id: userId });
-
-    const savedIds: string[] = user?.savedTuitionIds ?? [];
-
-    // Clean up references to tuitions that no longer exist, so a student's
-    // saved list never contains dangling ids.
-    const validIds = savedIds.filter((id) => ObjectId.isValid(id));
-
-    let tuitions: TuitionDoc[] = [];
-    if (validIds.length > 0) {
-      tuitions = await getDb()
-        .collection<TuitionDoc>('tuitions')
-        .find({ _id: { $in: validIds.map((id) => new ObjectId(id)) } })
-        .sort({ createdAt: -1 })
-        .toArray();
-    }
-
-    const existingIds = new Set(tuitions.map((t) => t._id.toString()));
-    const cleanedIds = savedIds.filter((id) => existingIds.has(id));
-
-    if (cleanedIds.length !== savedIds.length) {
-      await getDb()
-        .collection<UserDoc>('users')
-        .updateOne({ _id: userId }, { $set: { savedTuitionIds: cleanedIds }, $currentDate: { updatedAt: true } });
-    }
-
-    // Enrich with tutor information (mirrors the single-tuition detail endpoint).
-    const tutorIds = [...new Set(tuitions.map((t) => t.tutorId).filter(Boolean))];
-    const tutors = await getDb()
-      .collection<UserDoc>('users')
-      .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id.toString())) } })
-      .toArray();
-    const tutorMap = new Map(
-      tutors.map((t) => [t._id.toString(), { _id: t._id.toString(), name: t.name, email: t.email, image: t.image }])
-    );
-
-    const savedTuitions = tuitions.map((t) => ({
-      ...t,
-      tutor: {
-        _id: t.tutorId?.toString() ?? '',
-        name: tutorMap.get(t.tutorId?.toString() ?? '')?.name || t.tutorName || 'Tutor',
-        email: tutorMap.get(t.tutorId?.toString() ?? '')?.email || t.tutorEmail,
-        image: tutorMap.get(t.tutorId?.toString() ?? '')?.image,
-      },
-    }));
-
-    res.json({
-      savedTuitions,
-      total: savedTuitions.length,
-      savedTuitionIds: cleanedIds,
-      limit: BOOKMARK_FREE_LIMIT,
-      plan: req.user.plan,
-      unlimited: req.user.plan === 'pro',
-    });
-  } catch (error) {
-    next(error);
-  }
-});
 
 /** Tutor activates or closes their own tuition (isActive toggle). */
 app.patch(
