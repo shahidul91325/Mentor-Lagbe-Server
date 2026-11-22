@@ -11,14 +11,18 @@ export async function verifyToken(req, res, next) {
             return;
         }
         const decoded = jwt.verify(header.slice(7), env.jwtSecret);
-        if (!decoded.sub || !ObjectId.isValid(decoded.sub)) {
+        const sub = decoded.sub || decoded.id;
+        if (!sub) {
             res.status(401).json({ message: "Invalid authentication token." });
             return;
         }
+        const query = ObjectId.isValid(sub)
+            ? { $or: [{ _id: new ObjectId(sub) }, { _id: sub }, { id: sub }] }
+            : { $or: [{ _id: sub }, { id: sub }] };
         // The role/plan always come from trusted server-side data.
         const user = await getDb()
             .collection("users")
-            .findOne({ _id: new ObjectId(decoded.sub) });
+            .findOne(query);
         if (!user) {
             res.status(401).json({ message: "This account no longer exists." });
             return;
@@ -43,10 +47,10 @@ function requireRole(req, res, next, allowed) {
     next();
 }
 export function verifyStudent(req, res, next) {
-    requireRole(req, res, next, ["student"]);
+    requireRole(req, res, next, ["student", "admin"]);
 }
 export function verifyTutor(req, res, next) {
-    requireRole(req, res, next, ["tutor"]);
+    requireRole(req, res, next, ["tutor", "admin"]);
 }
 export function verifyAdmin(req, res, next) {
     requireRole(req, res, next, ["admin"]);

@@ -40,7 +40,7 @@ function createBetterAuth() {
                     type: "string",
                     required: true,
                     input: true,
-                    validator: { input: z.enum(["student", "tutor"]) },
+                    validator: { input: z.enum(["student", "tutor", "admin"]) },
                 },
                 plan: {
                     type: "string",
@@ -65,6 +65,33 @@ function createBetterAuth() {
         session: { modelName: "sessions" },
         account: { modelName: "accounts" },
         verification: { modelName: "verifications" },
+        // Defense-in-depth for role security. The zod validator above already
+        // rejects "admin" during public sign-up; these hooks make sure the role
+        // can never become "admin" through BetterAuth's own user endpoints.
+        // Admin accounts are provisioned only by an existing admin through
+        // PATCH /api/admin/users/:id/role (or directly in the database).
+        databaseHooks: {
+            user: {
+                create: {
+                    before: async (user) => {
+                        const role = user.role;
+                        if (role === "admin") {
+                            throw new Error("Admin accounts cannot be created through public registration.");
+                        }
+                        return;
+                    },
+                },
+                update: {
+                    before: async (user) => {
+                        const role = user.role;
+                        if (role === "admin") {
+                            throw new Error("The admin role can only be assigned by an administrator.");
+                        }
+                        return;
+                    },
+                },
+            },
+        },
         advanced: {
             // Cross-site cookies are required in production (Vercel → Render).
             // In development everything runs on localhost, so SameSite=Lax works.
