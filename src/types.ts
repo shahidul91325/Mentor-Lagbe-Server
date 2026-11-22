@@ -14,6 +14,8 @@ export interface UserDoc {
   bio?: string;
   plan: 'free' | 'pro'; // default for new accounts is "free"
   stripeCustomerId?: string;
+  /** Tuition _ids (as strings) saved/bookmarked by this student. */
+  savedTuitionIds?: string[];
   createdAt: Date;
   updatedAt?: Date;
 }
