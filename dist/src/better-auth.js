@@ -40,7 +40,7 @@ function createBetterAuth() {
                     type: "string",
                     required: true,
                     input: true,
-                    validator: { input: z.enum(["student", "tutor", "admin"]) },
+                    validator: { input: z.enum(["student", "tutor"]) },
                 },
                 plan: {
                     type: "string",
@@ -74,7 +74,8 @@ function createBetterAuth() {
             user: {
                 create: {
                     before: async (user) => {
-                        const role = user.role;
+                        const role = user.role ??
+                            user.data?.role;
                         if (role === "admin") {
                             throw new Error("Admin accounts cannot be created through public registration.");
                         }
@@ -83,7 +84,8 @@ function createBetterAuth() {
                 },
                 update: {
                     before: async (user) => {
-                        const role = user.role;
+                        const role = user.role ??
+                            user.data?.role;
                         if (role === "admin") {
                             throw new Error("The admin role can only be assigned by an administrator.");
                         }

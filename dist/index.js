@@ -100,19 +100,55 @@ app.get('/api/health', async (_req, res, next) => {
 const handleAuthToken = async (req, res, next) => {
     try {
         let userId = null;
-        // 1. Try BetterAuth session first
+        const cookieHeader = req.headers.cookie || '';
+        const hasCookie = !!cookieHeader;
+        // Log incoming request details for diagnostics (no sensitive data)
+        console.info('[auth/token] Request received', {
+            method: req.method,
+            hasCookie,
+            cookieLength: cookieHeader.length,
+            cookieNames: cookieHeader.split(';').map(c => c.trim().split('=')[0]),
+            hasAuthHeader: !!req.headers.authorization,
+            userAgent: req.headers['user-agent']?.substring(0, 50),
+        });
+        // 1. Try BetterAuth session using standard header conversion
+        // This preserves all cookies including session cookies for cross-origin requests
         try {
             const session = await getAuth().api.getSession({
                 headers: fromNodeHeaders(req.headers),
             });
             if (session?.user?.id) {
                 userId = session.user.id;
+                console.info('[auth/token] Session validated via fromNodeHeaders', { userId });
+            }
+            else {
+                console.debug('[auth/token] fromNodeHeaders returned no session');
             }
         }
-        catch {
-            // BetterAuth session lookup may fail on malformed headers; fall back to Bearer token
+        catch (err) {
+            console.debug('[auth/token] getSession via fromNodeHeaders failed:', err instanceof Error ? err.message : 'unknown error');
         }
-        // 2. If no BetterAuth session, check Authorization: Bearer <token>
+        // 2. Fallback: pass the complete original Cookie header to BetterAuth
+        // This handles cases where fromNodeHeaders doesn't properly forward cookies in serverless environments
+        if (!userId && hasCookie) {
+            try {
+                const headers = new Headers();
+                headers.set('cookie', cookieHeader);
+                const session = await getAuth().api.getSession({ headers });
+                if (session?.user?.id) {
+                    userId = session.user.id;
+                    console.info('[auth/token] Session validated via full Cookie header fallback', { userId });
+                }
+                else {
+                    console.debug('[auth/token] Full Cookie header fallback returned no session');
+                }
+            }
+            catch (err) {
+                console.debug('[auth/token] getSession via full Cookie header failed:', err instanceof Error ? err.message : 'unknown error');
+            }
+        }
+        // 3. If no BetterAuth session, check Authorization: Bearer <token>
+        // Only used as last resort for API clients that use JWT directly
         if (!userId && req.headers.authorization?.startsWith('Bearer ')) {
             const rawToken = req.headers.authorization.slice(7);
             try {
@@ -120,13 +156,21 @@ const handleAuthToken = async (req, res, next) => {
                 const sub = decoded.sub || decoded.id;
                 if (sub) {
                     userId = String(sub);
+                    console.info('[auth/token] User authenticated via Bearer JWT fallback', { userId });
                 }
             }
-            catch {
-                // Invalid or expired JWT
+            catch (err) {
+                console.debug('[auth/token] Bearer JWT verification failed:', err instanceof Error ? err.message : 'unknown error');
             }
         }
         if (!userId) {
+            console.warn('[auth/token] No valid session found', {
+                hasCookie,
+                cookieNames: cookieHeader.split(';').map(c => c.trim().split('=')[0]),
+                triedFromNodeHeaders: true,
+                triedFullCookieHeader: hasCookie,
+                triedBearerToken: !!req.headers.authorization?.startsWith('Bearer '),
+            });
             res.status(401).json({
                 message: 'No active session. Please sign in first.',
             });
@@ -138,11 +182,13 @@ const handleAuthToken = async (req, res, next) => {
             : { $or: [{ _id: userId }, { id: userId }] };
         const user = await db.collection('users').findOne(query);
         if (!user) {
+            console.warn('[auth/token] User not found in database for userId:', userId);
             res.status(401).json({
                 message: 'This account no longer exists.',
             });
             return;
         }
+        console.info('[auth/token] JWT minted successfully', { userId: user._id.toString(), role: user.role });
         const payload = {
             sub: user._id.toString(),
             id: user._id.toString(),
@@ -176,6 +222,13 @@ app.use('/api/auth', (req, res) => {
         });
         return;
     }
+    // Diagnostic logging for BetterAuth routes
+    console.info('[better-auth] Request received', {
+        method: req.method,
+        path: req.path,
+        hasCookie: !!req.headers.cookie,
+        cookieNames: (req.headers.cookie || '').split(';').map(c => c.trim().split('=')[0]),
+    });
     return authNodeHandler(req, res);
 });
 // ---------------------------------------------------------------------------
