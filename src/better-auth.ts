@@ -19,6 +19,14 @@ import { env } from "./env.js";
 import { getDb } from "./db.js";
 
 const IS_PRODUCTION = env.nodeEnv === "production";
+// Cookie security must follow the public base URL (HTTPS in production), not
+// only NODE_ENV. When the backend is reached over https:// (production or a
+// TLS-terminated proxy) cookies are marked Secure/SameSite=None so browsers
+// store and send them across the separate frontend/backend hostnames. On
+// http:// localhost they stay SameSite=Lax (localhost is same-site for
+// browsers, which is why local development keeps working).
+const IS_SECURE_BASE_URL = env.betterAuthUrl.startsWith("https://");
+const COOKIE_SECURE = IS_SECURE_BASE_URL || IS_PRODUCTION;
 
 let authInstance: ReturnType<typeof createBetterAuth> | null = null;
 
@@ -107,12 +115,14 @@ function createBetterAuth() {
     },
 
     advanced: {
-      // Cross-site cookies are required in production (Vercel → Render).
-      // In development everything runs on localhost, so SameSite=Lax works.
-      useSecureCookies: IS_PRODUCTION,
+      // Cross-site cookies are required in production (separate Vercel
+      // hostnames). Derived from the public base URL so cookies stay correct
+      // even if NODE_ENV is misconfigured, as long as BETTER_AUTH_URL is
+      // https://.
+      useSecureCookies: COOKIE_SECURE,
       defaultCookieAttributes: {
-        sameSite: IS_PRODUCTION ? "none" : "lax",
-        secure: IS_PRODUCTION,
+        sameSite: COOKIE_SECURE ? "none" : "lax",
+        secure: COOKIE_SECURE,
       },
     },
   });
